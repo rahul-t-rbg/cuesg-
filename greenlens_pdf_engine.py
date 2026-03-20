@@ -15,7 +15,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from sklearn.ensemble import GradientBoostingRegressor, IsolationForest
 
-# ── PDF engine (ReportLab-based, replaces CorporateDossierPDF entirely) ──────
 try:
     from greenlens_pdf_engine import build_pdf_report_v2 as _build_pdf_report_v2
     _PDF_ENGINE_AVAILABLE = True
@@ -622,12 +621,8 @@ class AdvancedAI:
         capex = solar_kw * 45_000.0 if solar_kw > 0 else 1.0
         roi = 0.0 if solar_kw <= 0 else (savings / capex) * 100.0
         return forecast, {"annual_energy_delta_kwh": energy_delta, "annual_carbon_delta_tco2e": carbon_delta, "annual_cost_saving_inr": savings, "estimated_roi_pct": roi}
-
-
-# ── CorporateDossierPDF has been removed. PDF generation is now handled ───────
-# ── entirely by greenlens_pdf_engine.py (ReportLab-based).             ───────
-
-
+         ───────
+        
 class RegulatoryIntelligence:
     def __init__(self, math_engine: DeterministicMath | None = None, ai_engine: AdvancedAI | None = None) -> None:
         self.math_engine = math_engine or DeterministicMath()
