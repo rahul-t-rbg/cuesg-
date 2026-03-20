@@ -30,7 +30,6 @@ MAX_CHAT_HISTORY = 80
 
 def inject_css(control_room: bool) -> None:
     chat_display = "none" if control_room else "flex"
-    # Inject font link tags separately — more reliable than @import alone in Streamlit
     st.markdown(
         '<link rel="preconnect" href="https://fonts.googleapis.com">'
         '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
@@ -919,8 +918,6 @@ f"""<div class="cmd-snapshot">
     )
 
 
-# --- ALL ORIGINAL WORKSPACE FUNCTIONS BELOW (UNCHANGED IN LOGIC) ---
-
 def render_dossier_console(package, forecast_df: pd.DataFrame) -> None:
     rankings = package.asset_rankings.reset_index(drop=True)
     anomaly_preview = package.anomaly_records.head(8).reset_index(drop=True)
@@ -1652,7 +1649,6 @@ with main_col:
             unsafe_allow_html=True,
         )
 
-        # Chat — only render the shell when there's something to show
         has_messages = len(st.session_state.messages) > 0
         if has_messages:
             st.markdown("<div class='chat-shell'>", unsafe_allow_html=True)
@@ -1680,7 +1676,6 @@ if not st.session_state.control_room:
                 f"Show numbers and percentage changes."
             )
 
-# Chat input — always rendered last so it docks correctly
 prompt = st.session_state.queued_prompt or st.chat_input("Issue a data query, mutation, simulation, or export command")
 
 if prompt:
@@ -1741,7 +1736,6 @@ if package is not None:
     render_command_snapshot(package)
     render_control_header(package)
 
-    # Metric strip
     cards = st.columns(6, gap="small")
     card_data = [
         ("Scope 1  ·  CEA/IPCC", f"{package.summary['scope1_total']:.1f} tCO₂e"),
@@ -1779,7 +1773,7 @@ if package is not None:
     with ops_tab:
         left, right = st.columns([1.15, 0.85], gap="large")
         with left:
-            # Reuse cached forecast — never recompute on every render
+        
             if st.session_state.cached_forecast_df is None or st.session_state.get("_forecast_sig") != package.source_name:
                 st.session_state.cached_forecast_df = ai_engine.forecast_portfolio(package.df, months=12)
                 st.session_state["_forecast_sig"] = package.source_name
@@ -1862,7 +1856,7 @@ if package is not None:
         )
         benchmark_fig = go.Figure()
         benchmark_fig.add_bar(x=benchmark_df["Climate_Zone"], y=benchmark_df["Avg_Energy_Intensity"], name="Energy Intensity (kWh/m²)", marker_color="#58a6ff")
-        # BEE EUI benchmark line
+     
         benchmark_fig.add_scatter(x=benchmark_df["Climate_Zone"], y=[160]*len(benchmark_df), mode="lines", name="BEE EUI Baseline 160 kWh/m² (BEE Star Rating)", line=dict(color="#f85149", dash="dot", width=2))
         benchmark_fig.update_layout(**fig_layout("Energy Intensity vs BEE Baseline  ·  Source: BEE Star Rating (140–180 kWh/m²/yr)"), yaxis=dict(title="Energy Intensity (kWh/m²)"))
         figures["Climate Benchmark Monitor"] = benchmark_fig
@@ -1876,7 +1870,7 @@ if package is not None:
         bee_fig.update_layout(**fig_layout("BEE Rating · Energy Intensity (kWh/m²)"))
         render_plot(bee_fig, key="bee_leaderboard_main")
 
-    # Use cached forecast — only compute once per source file
+
     if st.session_state.cached_forecast_df is None or st.session_state.get("_forecast_sig") != package.source_name:
         with st.spinner("Computing 12-month forecast..."):
             st.session_state.cached_forecast_df = ai_engine.forecast_portfolio(package.df, months=12)
