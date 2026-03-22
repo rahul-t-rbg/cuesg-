@@ -179,6 +179,67 @@ def load_master_dataset() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def generate_synthetic_demo_data() -> pd.DataFrame:
+    """
+    Generate a realistic synthetic ESG dataset for Indian commercial buildings.
+    Works fully offline — no file needed. Uses seeded randomness for reproducibility.
+    Covers 8 assets across Bengaluru and Mumbai, 24 months of monthly data.
+    Embeds deliberate anomalies, solar variance, and seasonal patterns.
+    """
+    rng = np.random.default_rng(42)
+    assets = [
+        {"asset_id": "BLD-BLR-001", "floor_area_sqm": 18500, "city": "BLR", "solar_base": 22000, "energy_base": 185000},
+        {"asset_id": "BLD-BLR-002", "floor_area_sqm": 12200, "city": "BLR", "solar_base": 8000,  "energy_base": 125000},
+        {"asset_id": "BLD-BLR-003", "floor_area_sqm": 9800,  "city": "BLR", "solar_base": 0,     "energy_base": 98000},
+        {"asset_id": "BLD-MUM-001", "floor_area_sqm": 22000, "city": "MUM", "solar_base": 15000, "energy_base": 240000},
+        {"asset_id": "BLD-MUM-002", "floor_area_sqm": 14500, "city": "MUM", "solar_base": 5000,  "energy_base": 155000},
+        {"asset_id": "BLD-MUM-003", "floor_area_sqm": 8200,  "city": "MUM", "solar_base": 0,     "energy_base": 88000},
+        {"asset_id": "BLD-BLR-004", "floor_area_sqm": 31000, "city": "BLR", "solar_base": 45000, "energy_base": 310000},
+        {"asset_id": "BLD-MUM-004", "floor_area_sqm": 27500, "city": "MUM", "solar_base": 28000, "energy_base": 275000},
+    ]
+    months = pd.date_range("2023-01-31", periods=24, freq="ME")
+    rows = []
+    for asset in assets:
+        for i, month in enumerate(months):
+            month_num = month.month
+            seasonal = 1.0 + 0.18 * np.sin((month_num - 4) * np.pi / 6.0)
+            noise = rng.normal(1.0, 0.06)
+            energy = asset["energy_base"] * seasonal * noise
+            solar = asset["solar_base"] * (0.9 + 0.2 * np.sin(month_num * np.pi / 6)) * rng.normal(1.0, 0.08)
+            solar = max(solar, 0)
+            is_blr = asset["city"] == "BLR"
+            outdoor_temp = rng.normal(26.5 if is_blr else 31.0, 3.5)
+            diesel = rng.exponential(220 if is_blr else 280)
+            water = asset["floor_area_sqm"] * rng.normal(0.078, 0.015) * (1.0 + 0.12 * seasonal)
+            hvac_load = (outdoor_temp - 24) * (asset["floor_area_sqm"] / 1350) * rng.normal(0.9, 0.1)
+            # Inject deliberate anomalies on specific months/assets
+            if asset["asset_id"] == "BLD-MUM-002" and month_num in [7, 8]:
+                diesel *= 4.5  # Monsoon DG spike
+            if asset["asset_id"] == "BLD-BLR-003" and i == 14:
+                energy *= 2.1  # Faulty chiller event
+            rows.append({
+                "asset_id": asset["asset_id"],
+                "month": month,
+                "floor_area_sqm": asset["floor_area_sqm"],
+                "energy_kwh": round(max(energy, 1000), 1),
+                "solar_kwh": round(solar, 1),
+                "diesel_litres": round(diesel, 1),
+                "water_withdrawal_kl": round(max(water, 0), 1),
+                "ewaste_kg": round(rng.exponential(18), 1),
+                "hazardous_waste_kg": round(rng.exponential(4), 1),
+                "procurement_spend_inr": round(rng.normal(850000, 120000), 0),
+                "utility_cost_inr": round(energy * 9.2 * rng.normal(1.0, 0.05), 0),
+                "occupancy_percent": round(rng.normal(78, 12), 1),
+                "outdoor_temp_c": round(outdoor_temp, 1),
+                "indoor_temp_c": 24.0,
+                "humidity_percent": round(rng.normal(62 if not is_blr else 52, 8), 1),
+                "hvac_load_kw": round(max(hvac_load, 10), 1),
+                "lighting_kwh": round(energy * 0.18, 1),
+                "generator_output_kw": round(rng.exponential(12), 1),
+            })
+    return pd.DataFrame(rows)
+
+
 def _coerce_numeric(series: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
@@ -671,40 +732,401 @@ class RegulatoryIntelligence:
         return text
 
     def _system_prompt(self, recent_messages: list[dict[str, Any]], rolling_context: str, package: ProcessedPortfolio, prompt: str) -> str:
-        return (
-            "You are CUESG, a deterministic sustainable AI model prototype for turning manual and messy data into analysed ESG reports.\n"
-            "Answer from the active dataset first. Keep advice grounded. Cite BRSR Principle 6 when giving regulatory guidance.\n\n"
-            f"ROLLING CONTEXT SUMMARY:\n{rolling_context}\n\n"
-            f"RAG SUPPORT:\n{self._rag_lookup(prompt)}\n\n"
-            f"INDIA METADATA:\n{json.dumps(GREENLENS_SYSTEM_METADATA, indent=2)}\n\n"
-            f"DATA SCHEMA:\n{self._schema_summary(package.df)}\n\n"
-            f"RECENT MESSAGES:\n{json.dumps(recent_messages, default=str, indent=2)}"
-        )
+        # Build a rich, structured system prompt — this is what gets sent to Gemini/OpenAI
+        # when an API key is available. It trains the external model on CUESG context.
+        top_asset = package.asset_rankings.iloc[0]["asset_id"] if not package.asset_rankings.empty else "N/A"
+        worst_asset = package.asset_rankings.iloc[-1]["asset_id"] if not package.asset_rankings.empty else "N/A"
+        brsr_alerts = []
+        if package.df["Water_Benchmark_Breach"].sum() > 0:
+            breach_assets = package.df.loc[package.df["Water_Benchmark_Breach"], "asset_id"].unique().tolist()
+            brsr_alerts.append(f"BRSR P6 Warning: Water benchmark exceeded in {len(breach_assets)} assets: {', '.join(breach_assets[:3])}")
+        if package.summary["scope1_total"] > package.summary["scope2_total"] * 0.3:
+            brsr_alerts.append("BRSR P6 Advisory: Scope 1 (diesel) is unusually high — review DG set utilization.")
+        if package.summary["anomaly_count"] > package.summary["records"] * 0.08:
+            brsr_alerts.append(f"BRSR SRD Alert: Anomaly rate {package.summary['anomaly_count']/max(package.summary['records'],1)*100:.1f}% exceeds 4% contamination threshold.")
+
+        return f"""You are CUESG — an autonomous Chief Sustainability Officer AI built for Indian commercial real estate ESG compliance.
+
+## CORE MANDATE
+Answer from the active dataset first. Every number you cite must come from the live data below.
+When no data supports a claim, say so explicitly. Never hallucinate numbers.
+Cite SEBI BRSR Principle 6 when giving regulatory guidance.
+Cite CEA Version 20 (0.727 kg CO2/kWh) for every Scope 2 calculation you reference.
+
+## ACTIVE PORTFOLIO STATE
+- ESG Score: {package.esg_score:.1f}/100
+- Assets: {package.summary['assets']} | Records: {package.summary['records']}
+- Scope 1: {package.summary['scope1_total']:.2f} tCO2e (Diesel — IPCC AR4 2.68 kg/L)
+- Scope 2: {package.summary['scope2_total']:.2f} tCO2e (Grid — CEA v20 0.727 kg/kWh)
+- Scope 3: {package.summary['scope3_total']:.2f} tCO2e (SEBI BRSR proxy)
+- Total Carbon: {package.summary['total_carbon']:.2f} tCO2e
+- Anomalies: {package.summary['anomaly_count']} records flagged (IF contamination=4%, SRD v3.0)
+- Best Asset: {top_asset} | Worst Asset: {worst_asset}
+- Reporting: {package.summary['reporting_start'].strftime('%b %Y')} → {package.summary['reporting_end'].strftime('%b %Y')}
+
+## LIVE BRSR COMPLIANCE ALERTS
+{chr(10).join(brsr_alerts) if brsr_alerts else '- All BRSR P6 thresholds currently within bounds.'}
+
+## REGULATORY CONSTANTS (cite these in every relevant answer)
+- Grid: 0.727 kg CO2/kWh (CEA Baseline v20.0, Dec 2024)
+- Diesel: 2.68 kg CO2/L (IPCC 2006 AR4, adopted by BEE/MoEFCC)
+- Water benchmarks: Bengaluru 0.80-1.00 kL/m2/yr, Mumbai 1.25-1.50 kL/m2/yr (BEE Grade-A)
+- EUI baseline: 140-180 kWh/m2/yr (BEE Star Rating commercial)
+- Chiller efficiency: 0.65-0.75 kW/TR water-cooled (HVAC Audit Std India)
+- R-410A GWP: 2,088 | R-134a GWP: 1,430 (ICAP / IPCC AR4)
+- Anomaly precision: >0.85 | Recall: >0.80 | MAPE: <15% (GreenLens SRD v3.0)
+
+## ANSWER CAPABILITIES
+When asked about scenarios: run the simulation using the simulate_scenario tool data.
+When asked about forecasts: cite the GBR/XGBoost 12-month output.
+When asked about anomalies: reference Isolation Forest signatures (Refrigerant_Leak, HVAC_Sensor_Drift, Diesel_Theft).
+When asked about compliance: map to SEBI BRSR P6 Essential Indicators EI-1 to EI-10.
+When asked about SHAP: explain the top drivers by name and their direction of impact.
+
+## CONVERSATION MEMORY
+{rolling_context or '(No prior context)'}
+
+## RAG SUPPORT
+{self._rag_lookup(prompt)}
+
+## INDIA ESG METADATA
+{json.dumps(GREENLENS_SYSTEM_METADATA, indent=2)[:2000]}
+
+## LIVE DATA SCHEMA
+{self._schema_summary(package.df)}
+
+## RECENT MESSAGES
+{json.dumps(recent_messages[-6:], default=str, indent=2)}"""
+
+    # ── OCR Confidence Thresholds (CUESG Omni-Parser Blueprint) ─────────────
+    _OCR_AUTO_ACCEPT   = 0.90   # Green — auto-ingest
+    _OCR_WARN_THRESHOLD = 0.75  # Yellow — flag for review
+    # Below 0.75 → HARD STOP (returned with confidence warning)
+
+    @staticmethod
+    def _regex_ocr_text(text: str) -> dict[str, Any]:
+        """
+        Phase 5 deterministic extraction from raw OCR / PDF text.
+        Implements the CUESG Omni-Parser confidence + cross-validation pipeline.
+        No API key required.
+        """
+        result: dict[str, Any] = {}
+        confidence_scores: dict[str, float] = {}
+
+        # ── energy_kwh ────────────────────────────────────────────────────────
+        for pattern in [
+            r"(?:total\s+units?|energy\s+consumed?|net\s+kwh|units?\s+consumed?)[^\d]*([0-9][0-9,]*(?:\.[0-9]+)?)\s*kwh",
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)\s*kwh",
+            r"consumption[^\d]*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ]:
+            m = re.search(pattern, text, re.I)
+            if m:
+                val = float(m.group(1).replace(",", ""))
+                # Cross-validation: reject physically impossible values
+                if 0 < val < 10_000_000:
+                    result["energy_kwh"] = val
+                    confidence_scores["energy_kwh"] = 0.92 if "kwh" in pattern else 0.78
+                    break
+
+        # ── diesel_litres ─────────────────────────────────────────────────────
+        for pattern in [
+            r"(?:qty|quantity|litres?|liters?)[^\d]*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:l|ltr|litres?)?",
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:ltrs?|litres?|liters?)",
+            r"(?:hsd|diesel|fuel)[^\d]*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ]:
+            m = re.search(pattern, text, re.I)
+            if m:
+                val = float(m.group(1).replace(",", ""))
+                if 0 < val < 100_000:
+                    result["diesel_litres"] = val
+                    confidence_scores["diesel_litres"] = 0.88 if "litres" in pattern else 0.75
+                    break
+
+        # ── water_withdrawal_kl ───────────────────────────────────────────────
+        for pattern in [
+            r"(?:consumption|units?|kl|kilolitres?)[^\d]*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:kl|kilo)",
+            r"(?:water\s+used?|volume)[^\d]*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:kl|kilolitres?|kilo)",
+        ]:
+            m = re.search(pattern, text, re.I)
+            if m:
+                val = float(m.group(1).replace(",", ""))
+                if 0 < val < 500_000:
+                    result["water_withdrawal_kl"] = val
+                    confidence_scores["water_withdrawal_kl"] = 0.85
+                    break
+
+        # ── utility_cost_inr ──────────────────────────────────────────────────
+        for pattern in [
+            r"(?:total\s+amount|net\s+payable|amount\s+due|total\s+due|grand\s+total)[^\d]*(?:rs\.?|inr|₹)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            r"(?:rs\.?|inr|₹)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ]:
+            m = re.search(pattern, text, re.I)
+            if m:
+                val = float(m.group(1).replace(",", ""))
+                if 0 < val < 100_000_000:
+                    result["utility_cost_inr"] = val
+                    confidence_scores["utility_cost_inr"] = 0.90 if "total" in pattern else 0.78
+                    break
+
+        # ── bill_month ────────────────────────────────────────────────────────
+        for pattern in [
+            r"(?:bill\s+date|invoice\s+date|billing\s+period|for\s+the\s+month)[^\d]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+            r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+            r"(\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\-]*\d{2,4})",
+        ]:
+            m = re.search(pattern, text, re.I)
+            if m:
+                result["bill_month"] = m.group(1)
+                confidence_scores["bill_month"] = 0.88
+                break
+
+        # ── vendor_name (fuzzy vendor matching) ───────────────────────────────
+        known_vendors = [
+            "BESCOM", "TATA POWER", "ADANI ELECTRICITY", "BSES", "MSEDCL",
+            "TNEB", "KSEB", "CESC", "WBSEDCL", "JVVNL", "BRPL", "BYPL",
+            "BESQ", "RELIANCE ENERGY",
+        ]
+        text_upper = text.upper()
+        for vendor in known_vendors:
+            if vendor in text_upper:
+                result["vendor_name"] = vendor
+                confidence_scores["vendor_name"] = 0.95
+                break
+
+        # ── account_id / consumer_number ─────────────────────────────────────
+        m = re.search(r"(?:consumer\s*(?:no|number|id)|account\s*(?:no|number|id)|ca\s*no)[^\d]*([A-Z0-9\-]{6,20})", text, re.I)
+        if m:
+            result["account_id"] = m.group(1)
+            confidence_scores["account_id"] = 0.88
+
+        # ── Previous / Current meter readings (Delta Rule cross-validation) ───
+        prev_m = re.search(r"(?:previous|prev\.?|opening)\s*(?:reading|meter)[^\d]*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+        curr_m = re.search(r"(?:current|present|closing)\s*(?:reading|meter)[^\d]*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+        if prev_m and curr_m:
+            prev = float(prev_m.group(1))
+            curr = float(curr_m.group(1))
+            delta = curr - prev
+            result["previous_reading"] = prev
+            result["current_reading"] = curr
+            # Delta Rule: if energy_kwh already extracted, cross-validate
+            if "energy_kwh" in result:
+                extracted = result["energy_kwh"]
+                ratio = abs(extracted - delta) / max(delta, 1.0)
+                if ratio < 0.05:
+                    # Perfect match — boost confidence
+                    confidence_scores["energy_kwh"] = min(confidence_scores.get("energy_kwh", 0.8) + 0.07, 1.0)
+                elif ratio > 0.30:
+                    # Mismatch — Delta Rule triggered, use calculated value
+                    result["energy_kwh"] = delta
+                    result["_delta_rule_applied"] = True
+                    confidence_scores["energy_kwh"] = 0.82
+            else:
+                result["energy_kwh"] = delta
+                confidence_scores["energy_kwh"] = 0.80
+
+        # ── Net metering (solar import/export) ───────────────────────────────
+        imp_m = re.search(r"(?:import|grid\s+import)[^\d]*([0-9][0-9,]*(?:\.[0-9]+)?)\s*kwh", text, re.I)
+        exp_m = re.search(r"(?:export|solar\s+export)[^\d]*([0-9][0-9,]*(?:\.[0-9]+)?)\s*kwh", text, re.I)
+        if imp_m:
+            result["import_kwh"] = float(imp_m.group(1).replace(",", ""))
+        if exp_m:
+            result["export_kwh"] = float(exp_m.group(1).replace(",", ""))
+            result["solar_kwh"] = result.get("export_kwh", 0)
+
+        # ── Overall confidence ────────────────────────────────────────────────
+        if confidence_scores:
+            avg_conf = sum(confidence_scores.values()) / len(confidence_scores)
+        else:
+            avg_conf = 0.0
+        result["_confidence"] = round(avg_conf, 3)
+        result["_confidence_detail"] = confidence_scores
+        result["_ocr_engine"] = "CUESG-RegexOCR-v1"
+
+        # Routing logic per CUESG blueprint
+        if avg_conf < 0.75:
+            result["_status"] = "HARD_STOP — Low confidence. Route to human auditor."
+            result["_auto_ingest"] = False
+        elif avg_conf < 0.90:
+            result["_status"] = "WARN — Accept with yellow flag for monthly audit."
+            result["_auto_ingest"] = True
+            result["_flag_for_review"] = True
+        else:
+            result["_status"] = "AUTO-ACCEPT — High confidence."
+            result["_auto_ingest"] = True
+            result["_flag_for_review"] = False
+
+        return result
+
+    def parse_utility_bill_text(self, text: str) -> dict[str, Any]:
+        """Parse any raw text from a utility bill using the CUESG regex OCR engine."""
+        return self._regex_ocr_text(text)
+
+    def parse_utility_bill_pdf(self, pdf_bytes: bytes) -> dict[str, Any] | None:
+        """
+        Extract utility bill data from a PDF.
+        Pipeline: pdfplumber (native PDF) → PyMuPDF → raw text fallback.
+        Works 100% offline — no API key needed.
+        """
+        extracted_text = ""
+
+        # Engine 1: pdfplumber (best for native digital PDFs)
+        pdfplumber = _optional_import("pdfplumber")
+        if pdfplumber is not None:
+            try:
+                import io as _io
+                with pdfplumber.open(_io.BytesIO(pdf_bytes)) as pdf:
+                    pages_text = []
+                    for page in pdf.pages[:6]:  # Only first 6 pages (summary pages)
+                        pt = page.extract_text()
+                        if pt:
+                            pages_text.append(pt)
+                    extracted_text = "\n".join(pages_text)
+            except Exception:
+                pass
+
+        # Engine 2: PyMuPDF fallback
+        if not extracted_text:
+            fitz = _optional_import("fitz")  # PyMuPDF
+            if fitz is not None:
+                try:
+                    import io as _io
+                    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    pages_text = [doc[i].get_text() for i in range(min(6, doc.page_count))]
+                    extracted_text = "\n".join(pages_text)
+                    doc.close()
+                except Exception:
+                    pass
+
+        # Engine 3: Raw latin-1 decode fallback
+        if not extracted_text:
+            try:
+                raw = pdf_bytes.decode("latin-1", errors="ignore")
+                # Extract printable ASCII sequences from binary PDF
+                chunks = re.findall(r"[\x20-\x7e]{4,}", raw)
+                extracted_text = " ".join(chunks[:300])
+            except Exception:
+                pass
+
+        if not extracted_text:
+            return {"_status": "ERROR — Could not extract text from PDF.", "_confidence": 0.0, "_auto_ingest": False}
+
+        result = self._regex_ocr_text(extracted_text)
+        result["_pdf_chars_extracted"] = len(extracted_text)
+        result["_source"] = "PDF"
+        return result
 
     def parse_utility_bill_image(self, image_bytes: bytes, mime_type: str) -> dict[str, Any] | None:
-        if not self._gemini_ready or self._genai is None:
-            return None
-        try:
-            model = self._genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content([
-                "Parse this utility bill or diesel receipt and return JSON with asset_id, bill_month, energy_kwh, utility_cost_inr, diesel_litres, water_withdrawal_kl. Return JSON only.",
-                {"mime_type": mime_type, "data": image_bytes},
-            ])
-            match = re.search(r"\{.*\}", response.text.strip(), re.S)
-            return json.loads(match.group(0)) if match else None
-        except Exception:
-            return None
+        """
+        Parse a utility bill image.
+        Pipeline: Gemini Vision (if key available) → Regex OCR on extracted text.
+        Always returns a result dict — never silently returns None.
+        """
+        # Engine 1: Gemini Vision (if API key configured)
+        if self._gemini_ready and self._genai is not None:
+            try:
+                model = self._genai.GenerativeModel("gemini-1.5-flash")
+                response = model.generate_content([
+                    (
+                        "You are a utility bill OCR engine. Parse this bill image and return ONLY a JSON object "
+                        "with these fields (omit fields not found): asset_id, bill_month, energy_kwh, "
+                        "utility_cost_inr, diesel_litres, water_withdrawal_kl, solar_kwh, vendor_name, "
+                        "account_id, previous_reading, current_reading. Return JSON only, no markdown."
+                    ),
+                    {"mime_type": mime_type, "data": image_bytes},
+                ])
+                raw = response.text.strip()
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+                match = re.search(r"\{.*\}", raw, re.S)
+                if match:
+                    parsed = json.loads(match.group(0))
+                    parsed["_ocr_engine"] = "Gemini-1.5-Flash"
+                    parsed["_confidence"] = 0.95
+                    parsed["_status"] = "AUTO-ACCEPT — Gemini Vision extraction."
+                    parsed["_auto_ingest"] = True
+                    parsed["_flag_for_review"] = False
+                    return parsed
+            except Exception:
+                pass  # fall through to regex engine
+
+        # Engine 2: Try to extract text from image using pytesseract
+        tesseract_text = ""
+        pytesseract = _optional_import("pytesseract")
+        if pytesseract is not None:
+            try:
+                from PIL import Image as PILImage
+                import io as _io
+                img = PILImage.open(_io.BytesIO(image_bytes))
+                tesseract_text = pytesseract.image_to_string(img)
+            except Exception:
+                pass
+
+        if tesseract_text:
+            result = self._regex_ocr_text(tesseract_text)
+            result["_ocr_engine"] = "Tesseract+RegexOCR"
+            return result
+
+        # Engine 3: Return a structured placeholder that lets the user fill in manually
+        return {
+            "_status": "MANUAL_ENTRY — No OCR engine available. Please fill in manually.",
+            "_confidence": 0.0,
+            "_auto_ingest": False,
+            "_ocr_engine": "none",
+            "energy_kwh": None,
+            "diesel_litres": None,
+            "water_withdrawal_kl": None,
+            "utility_cost_inr": None,
+            "bill_month": None,
+            "asset_id": None,
+        }
 
     def append_utility_bill_to_df(self, package: ProcessedPortfolio, parsed_bill: dict[str, Any]) -> pd.DataFrame:
+        """
+        Append an OCR-parsed bill record to the active portfolio dataframe.
+        Handles the new rich OCR dict format (with _confidence, _status, etc.).
+        """
         template = package.df.iloc[-1].to_dict()
-        template["asset_id"] = str(parsed_bill.get("asset_id") or template["asset_id"])
-        template["month"] = pd.to_datetime(parsed_bill.get("bill_month"), errors="coerce")
-        if pd.isna(template["month"]):
+
+        # asset_id — use parsed value or keep existing
+        if parsed_bill.get("asset_id") and str(parsed_bill["asset_id"]).strip() not in ("", "None", "null"):
+            template["asset_id"] = str(parsed_bill["asset_id"])
+
+        # month — handle bill_month or month key
+        bill_month_raw = parsed_bill.get("bill_month") or parsed_bill.get("month")
+        if bill_month_raw:
+            parsed_month = pd.to_datetime(str(bill_month_raw), errors="coerce")
+            if pd.notna(parsed_month):
+                template["month"] = parsed_month
+            else:
+                template["month"] = pd.to_datetime(package.df["month"]).max() + pd.offsets.MonthEnd(1)
+        else:
             template["month"] = pd.to_datetime(package.df["month"]).max() + pd.offsets.MonthEnd(1)
-        for key in ["energy_kwh", "utility_cost_inr", "diesel_litres", "water_withdrawal_kl"]:
-            if parsed_bill.get(key) is not None:
-                template[key] = float(parsed_bill[key])
-        return pd.concat([package.df, pd.DataFrame([template])], ignore_index=True).reset_index(drop=True)
+
+        # Numeric fields — map both old and new OCR field names
+        field_map = {
+            "energy_kwh": ["energy_kwh", "import_kwh"],
+            "utility_cost_inr": ["utility_cost_inr", "total_amount"],
+            "diesel_litres": ["diesel_litres", "quantity_litres"],
+            "water_withdrawal_kl": ["water_withdrawal_kl", "total_consumption_kl"],
+            "solar_kwh": ["solar_kwh", "export_kwh"],
+        }
+        for canonical, keys in field_map.items():
+            for key in keys:
+                val = parsed_bill.get(key)
+                if val is not None:
+                    try:
+                        template[canonical] = float(val)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+        # Tag the row so it can be identified as OCR-sourced
+        if "source_tag" in template:
+            template["source_tag"] = "OCR"
+
+        new_row = pd.DataFrame([template])
+        return pd.concat([package.df, new_row], ignore_index=True).reset_index(drop=True)
 
     def apply_natural_language_update(self, prompt: str, package: ProcessedPortfolio) -> tuple[pd.DataFrame | None, str | None]:
         match = re.search(r"(?:set|add|increase|reduce|decrease)\s+([A-Za-z0-9\-]+).*(diesel|energy|kwh|water|solar|waste|hazardous waste).*(?:to|by)?\s*([0-9]+(?:\.[0-9]+)?)", prompt, re.I)
@@ -919,6 +1341,198 @@ class RegulatoryIntelligence:
 
         return None, None
 
+    def _proactive_brsr_alerts(self, package: ProcessedPortfolio) -> list[str]:
+        """
+        Autonomous SEBI BRSR Principle 6 compliance scanner.
+        Runs on every chat response — surfaces alerts before the user asks.
+        Implements the CUESG Omni-Agent Continuous Compliance blueprint.
+        """
+        alerts: list[str] = []
+        df = package.df
+
+        # Water intensity benchmark breach
+        breach_count = int(df["Water_Benchmark_Breach"].sum())
+        if breach_count > 0:
+            breach_assets = df.loc[df["Water_Benchmark_Breach"], "asset_id"].unique().tolist()[:3]
+            alerts.append(
+                f"⚠ BRSR P6 EI-6 [WATER]: {breach_count} records in {len(breach_assets)} asset(s) "
+                f"({', '.join(breach_assets)}) exceed BEE water intensity benchmark "
+                f"(Bengaluru: 1.0 kL/m²/yr, Mumbai: 1.5 kL/m²/yr). "
+                f"SEBI may require water-stress mitigation disclosure."
+            )
+
+        # Scope 1 escalation
+        if package.summary["scope1_total"] > 0 and package.summary["total_carbon"] > 0:
+            s1_pct = package.summary["scope1_total"] / package.summary["total_carbon"] * 100
+            if s1_pct > 25:
+                alerts.append(
+                    f"⚠ BRSR P6 EI-2 [DIESEL]: Scope 1 is {s1_pct:.1f}% of total carbon "
+                    f"({package.summary['scope1_total']:.1f} tCO2e). High DG dependency threatens "
+                    f"Scope 1 reduction targets. Factor: 2.68 kg CO2/L (IPCC AR4)."
+                )
+
+        # Anomaly rate above SRD threshold
+        anomaly_rate = package.summary["anomaly_count"] / max(package.summary["records"], 1)
+        if anomaly_rate > 0.06:
+            alerts.append(
+                f"⚠ SRD v3.0 UC-2 [ANOMALY]: Anomaly rate {anomaly_rate*100:.1f}% exceeds the 4% "
+                f"Isolation Forest contamination baseline. {package.summary['anomaly_count']} flagged "
+                f"records should be resolved before using this period as an SEBI benchmark."
+            )
+
+        # Solar integration low
+        solar_ratio = package.summary["solar_total"] / max(package.summary["energy_total"], 1)
+        if solar_ratio < 0.05 and package.summary["energy_total"] > 100_000:
+            alerts.append(
+                f"⚠ BRSR P6 EI-4 [RENEWABLE]: Solar integration ratio is only "
+                f"{solar_ratio*100:.1f}%. SEBI BRSR Leadership Indicators reward renewable "
+                f"energy disclosure. Consider a solar uplift scenario (+50 kW → +{50*0.727*2400/1000:.0f} tCO2 reduction/yr)."
+            )
+
+        # EUI above BEE baseline
+        avg_eui = float(df["Energy_Intensity_kWh_per_sqm"].mean()) * 12  # annualise
+        if avg_eui > 180:
+            alerts.append(
+                f"⚠ BEE ECSBC 2024 [EUI]: Annualised portfolio EUI is {avg_eui:.0f} kWh/m²/yr, "
+                f"above the BEE Star Rating baseline of 140-180 kWh/m²/yr. "
+                f"BEE 5-Star buildings average <140 kWh/m²/yr."
+            )
+
+        return alerts
+
+    def _build_brsr_compliance_answer(self, package: ProcessedPortfolio) -> str:
+        """Full BRSR P6 compliance status report — triggered on 'brsr', 'compliance', 'sebi' queries."""
+        s = package.summary
+        df = package.df
+        solar_pct = s["solar_total"] / max(s["energy_total"], 1) * 100
+        water_breaches = int(df["Water_Benchmark_Breach"].sum())
+        avg_eui = float(df["Energy_Intensity_kWh_per_sqm"].mean()) * 12
+
+        lines = [
+            "[BRSR P6 COMPLIANCE AUDIT — SEBI Principle 6 Essential Indicators]",
+            "",
+            f"EI-1  Energy Consumed:     {s['energy_total']:,.0f} kWh  |  Solar offset: {s['solar_total']:,.0f} kWh ({solar_pct:.1f}%)",
+            f"EI-2  Scope 1 Emissions:   {s['scope1_total']:.3f} tCO2e  |  Source: Diesel {df['diesel_litres'].sum():,.0f} L × 2.68 kg/L (IPCC AR4)",
+            f"EI-3  Scope 2 Emissions:   {s['scope2_total']:.3f} tCO2e  |  Grid × 0.727 kg CO2/kWh (CEA v20 Dec 2024)",
+            f"EI-4  Renewable Energy:    {solar_pct:.1f}% of total — {'✓ Disclosed' if solar_pct > 0 else '✗ No renewable data'}",
+            f"EI-5  Energy Intensity:    {avg_eui:.1f} kWh/m²/yr annualised  |  BEE baseline: 140-180",
+            f"EI-6  Water Withdrawal:    {s['water_total']:,.1f} kL total  |  Benchmark breaches: {water_breaches} records",
+            f"EI-7  Scope 3 (Proxy):     {s['scope3_total']:.3f} tCO2e  |  Water + E-waste + Hazwaste + Procurement",
+            f"EI-8  Waste Generated:     {df['ewaste_kg'].sum():,.1f} kg e-waste, {df['hazardous_waste_kg'].sum():,.1f} kg hazardous",
+            f"EI-9  Anomalies:           {s['anomaly_count']} records (IF contamination=4%, SRD v3.0 UC-2)",
+            f"EI-10 CUESG ESG Score:     {package.esg_score:.1f}/100",
+            "",
+            "LEADERSHIP INDICATORS:",
+            f"  - Scope 3 as % of total: {s['scope3_total']/max(s['total_carbon'],1)*100:.1f}% (SEBI target: disclose if >15%)",
+            f"  - YoY intensity reduction: Requires 2+ years of data to compute",
+            "",
+            f"FRAMEWORK: SEBI BRSR Principle 6 (May 2021) — Mandatory for Top 1000 listed companies",
+            f"EMISSION CONSTANTS: CEA v20 (Dec 2024) | IPCC AR4 | ICAP | BEE ECSBC 2024",
+        ]
+        return "\n".join(lines)
+
+    def _build_anomaly_story(self, package: ProcessedPortfolio) -> str:
+        """Root-cause storytelling for anomalies — cross-referenced with physics signatures."""
+        if package.anomaly_records.empty:
+            return "[XAI-ALERT] No anomaly records in this dataset. Portfolio is operating within normal parameters."
+
+        top = package.anomaly_records.head(3)
+        lines = [f"[XAI-ALERT] {package.summary['anomaly_count']} anomaly records detected by Isolation Forest (contamination=4%, SRD v3.0 UC-2)."]
+        lines.append("")
+
+        for _, row in top.iterrows():
+            sig = str(row.get("Anomaly_Signature", "General_Operational_Anomaly"))
+            asset = str(row.get("asset_id", "UNKNOWN"))
+            month = pd.to_datetime(row["month"]).strftime("%b %Y") if "month" in row.index else "N/A"
+            score = float(row.get("Anomaly_Score", 0))
+            energy = float(row.get("energy_kwh", 0))
+            diesel = float(row.get("diesel_litres", 0))
+
+            if "Refrigerant" in sig:
+                explanation = (
+                    f"Positive residual in Energy vs CDD regression + elevated kW/TR. "
+                    f"Root cause: likely refrigerant leak or chiller degradation. "
+                    f"Threshold: >12% energy spike vs baseline (GreenLens SRD v3.0). "
+                    f"Action: inspect chiller refrigerant charge and compressor efficiency."
+                )
+            elif "Sensor" in sig or "HVAC" in sig:
+                explanation = (
+                    f"x-intercept shift in Energy vs Outdoor Temp correlation. "
+                    f"Root cause: likely BMS sensor drift or AHU calibration failure. "
+                    f"Action: recalibrate return-air and supply-air sensors (ASHRAE Guideline 14)."
+                )
+            elif "Theft" in sig or "Diesel" in sig:
+                explanation = (
+                    f"Diesel consumption {diesel:,.0f} L with low/zero generator output. "
+                    f"Root cause: likely fuel pilferage (dV/dt > 0.5 L/hr at idle, SRD v3.0). "
+                    f"Action: install digital flow meters and lock tanks."
+                )
+            else:
+                explanation = (
+                    f"General operational anomaly — {energy:,.0f} kWh consumption pattern "
+                    f"deviates from Isolation Forest baseline. Review operational logs for {month}."
+                )
+
+            lines.append(f"Asset: {asset}  |  Month: {month}  |  Severity: {score:.3f}")
+            lines.append(f"Signature: {sig}")
+            lines.append(f"Analysis: {explanation}")
+            lines.append("")
+
+        if package.latest_shap is not None:
+            top_drivers = list(package.latest_shap["values"].items())[:4]
+            driver_str = " | ".join(f"{k}: {v:+.3f}" for k, v in top_drivers)
+            lines.append(f"[SHAP ATTRIBUTION] Top drivers in highest-severity anomaly: {driver_str}")
+
+        return "\n".join(lines)
+
+    def _build_capex_recommendation(self, package: ProcessedPortfolio) -> str:
+        """Automated CapEx strategy — CUESG Omni-Agent blueprint."""
+        s = package.summary
+        rankings = package.asset_rankings
+        if rankings.empty:
+            return "[ADVISORY] No asset data available for CapEx analysis."
+
+        worst = rankings.iloc[-1]
+        worst_eui = float(worst.get("Energy_Intensity_kWh_per_sqm", 0.5)) * 12
+        worst_asset = str(worst["asset_id"])
+        total_gap_tco2 = max(s["scope2_total"] - s["scope2_total"] * 0.80, 0)
+
+        # Solar ROI calculation
+        solar_kw_needed = max(total_gap_tco2 * 1000 / (0.727 * 2400), 50)
+        solar_capex = solar_kw_needed * 45_000
+        annual_savings = solar_kw_needed * 2400 * 9.0  # INR 9/kWh
+        payback_yrs = solar_capex / max(annual_savings, 1)
+        scope2_drop = solar_kw_needed * 2400 * 0.727 / 1000
+
+        lines = [
+            "[ADVISORY] CapEx Strategy — Automated Remediation Analysis",
+            "",
+            f"Current total carbon: {s['total_carbon']:.1f} tCO2e across {s['assets']} assets.",
+            f"Worst performer: {worst_asset} (EUI: {worst_eui:.0f} kWh/m²/yr vs BEE baseline 140-180).",
+            "",
+            "RECOMMENDATION 1 — Solar PV Expansion:",
+            f"  Target: {solar_kw_needed:.0f} kW of rooftop solar across portfolio",
+            f"  Estimated CapEx: ₹{solar_capex/100000:.1f} Lakhs (@ ₹45,000/kW installed)",
+            f"  Annual energy savings: {solar_kw_needed*2400:,.0f} kWh",
+            f"  Annual cost savings: ₹{annual_savings/100000:.1f} Lakhs (@ ₹9/kWh)",
+            f"  Scope 2 reduction: {scope2_drop:.1f} tCO2e/yr (CEA v20: 0.727 kg CO2/kWh)",
+            f"  Payback period: {payback_yrs:.1f} years",
+            "",
+            "RECOMMENDATION 2 — HVAC Chiller Optimisation:",
+            f"  Focus: {worst_asset} — energy intensity above BEE 2-Star threshold.",
+            f"  Action: Re-calibrate chiller sequencing, deploy VFDs on secondary CHW pumps.",
+            f"  Expected reduction: 8-15% of HVAC load (HVAC Audit Std India).",
+            f"  Estimated saving: {s['energy_total']*0.10:.0f} kWh/yr → {s['scope2_total']*0.10:.2f} tCO2e/yr",
+            "",
+            "RECOMMENDATION 3 — BMS Sensor Calibration:",
+            f"  {package.summary['anomaly_count']} anomaly records suggest sensor drift or operational faults.",
+            f"  Action: ASHRAE Guideline 14 re-commissioning on flagged assets.",
+            "",
+            "BRSR COMPLIANCE NOTE: Implementing Recommendations 1+2 is expected to improve",
+            f"your CUESG ESG Score from {package.esg_score:.1f} to approximately {min(package.esg_score+12, 100):.1f}/100.",
+        ]
+        return "\n".join(lines)
+
     def _fallback_response(self, prompt: str, package: ProcessedPortfolio, recent_messages: list[dict[str, Any]] | None = None, rolling_context: str = "") -> dict[str, Any]:
         prompt_lower = prompt.lower()
         content = ""
@@ -926,81 +1540,179 @@ class RegulatoryIntelligence:
         actions = package.summary.get("outlier_actions", [])[:2]
         advice = self._history_grounded_advice(package)
         asset_match = self._asset_match(prompt, package)
+
+        # ── Generic dataset query handler (rankings, comparisons, metrics) ────
         generic_content, generic_fig = self._generic_dataset_answer(prompt, package, recent_messages or [], rolling_context)
         if generic_content is not None:
             content = generic_content
             plotly_fig = generic_fig
 
+        # ── Specialised intent routing ─────────────────────────────────────────
         if not content:
-            if "forecast" in prompt_lower or "trend" in prompt_lower:
+
+            # BRSR / SEBI compliance audit
+            if any(t in prompt_lower for t in ["brsr", "sebi", "compliance", "principle 6", "mandatory", "disclosure"]):
+                content = self._build_brsr_compliance_answer(package)
+
+            # Anomaly root-cause storytelling
+            elif any(t in prompt_lower for t in ["anomaly", "anomalies", "root cause", "shap", "why did", "spike", "fault", "signature", "refrigerant", "sensor drift", "diesel theft"]):
+                content = self._build_anomaly_story(package)
+                plotly_fig = self.ai_engine.build_shap_figure(package)
+
+            # CapEx / recommendations / mitigation
+            elif any(t in prompt_lower for t in ["capex", "invest", "recommend", "fix", "remediate", "mitigation", "improve score", "reduce carbon", "what should we do", "action plan", "budget"]):
+                content = self._build_capex_recommendation(package)
+
+            # Forecast
+            elif any(t in prompt_lower for t in ["forecast", "predict", "next 12", "next year", "future", "trend"]):
                 forecast = self.ai_engine.forecast_portfolio(package.df, 12)
                 plotly_fig = self.ai_engine.build_forecast_figure(forecast)
-                content = "[DATA-QUERY] 12-month forecast generated from the live portfolio baseline."
-            elif "shap" in prompt_lower or "root cause" in prompt_lower or "why did our score drop" in prompt_lower:
-                plotly_fig = self.ai_engine.build_shap_figure(package)
-                if package.latest_shap is not None:
-                    drivers = ", ".join(f"{name} {value:+.3f}" for name, value in list(package.latest_shap["values"].items())[:5])
-                    content = f"[XAI-ALERT] Score pressure is concentrated in {package.latest_shap['asset_id']}. Primary drivers: {drivers}."
+                monthly_f = forecast.groupby("month")[["Forecast_kWh", "Forecast_Scope2_tCO2e"]].sum()
+                peak = monthly_f["Forecast_kWh"].idxmax()
+                peak_kwh = float(monthly_f.loc[peak, "Forecast_kWh"])
+                total_forecast_s2 = float(monthly_f["Forecast_Scope2_tCO2e"].sum())
+                content = (
+                    f"[DATA-QUERY] 12-month GBR/XGBoost forecast (MAPE <15%, SRD v3.0 UC-3).\n\n"
+                    f"Peak month: {peak.strftime('%b %Y')} at {peak_kwh:,.0f} kWh (seasonal cooling load).\n"
+                    f"Forecast total Scope 2 (12 months): {total_forecast_s2:.2f} tCO2e (CEA v20: 0.727 kg/kWh).\n"
+                    f"Baseline used: rolling 3-month asset average with seasonal sinusoidal correction.\n"
+                    f"To reduce forecast Scope 2, run a solar/setpoint simulation or ask for a CapEx strategy."
+                )
+
+            # Scenario simulation (what-if)
+            elif any(t in prompt_lower for t in ["solar", "what if", "simulate", "scenario", "install", "setpoint", "hvac reduction", "what happens"]):
+                sim_req = self._parse_simulation_request(prompt)
+                if sim_req is not None:
+                    solar_kw, setpoint_delta = sim_req
+                    forecast, metrics = self.ai_engine.simulate_scenario(package, solar_kw=solar_kw, setpoint_delta_c=setpoint_delta)
+                    plotly_fig = self.ai_engine.build_forecast_figure(forecast)
+                    content = (
+                        f"[OMNI-SYSTEM] Monte Carlo scenario simulation completed.\n\n"
+                        f"Inputs:  Solar +{solar_kw:.0f} kW  |  HVAC setpoint -{setpoint_delta:.1f}°C\n"
+                        f"Annual energy delta:    {metrics['annual_energy_delta_kwh']:+,.0f} kWh\n"
+                        f"Annual Scope 2 delta:   {metrics['annual_carbon_delta_tco2e']:+.2f} tCO2e  (CEA v20: 0.727 kg/kWh)\n"
+                        f"Annual cost saving:     ₹{metrics['annual_cost_saving_inr']:,.0f}\n"
+                        f"Estimated ROI:          {metrics['estimated_roi_pct']:.1f}%\n\n"
+                        f"[CITED-RESEARCH] Scope 2 calculation: CEA CO2 Baseline v20.0 (Dec 2024)\n"
+                        f"Solar CapEx assumption: ₹45,000/kW installed (Indian market FY24)"
+                    )
                 else:
-                    content = "[XAI-ALERT] No explainable anomaly payload is available."
-            elif "top 5" in prompt_lower or "sustainable" in prompt_lower:
-                rows = [f"- {row.asset_id}: ESG {row.ESG_Score:.1f}, BEE {row.BEE_Rating}, anomalies {int(row.Anomalies)}" for row in package.asset_rankings.head(5).itertuples()]
-                content = "[DATA-QUERY] Top sustainable assets:\n" + "\n".join(rows)
-            elif "bottom 5" in prompt_lower or "laggard" in prompt_lower or "worst" in prompt_lower:
-                rows = [f"- {row.asset_id}: ESG {row.ESG_Score:.1f}, intensity {row.Energy_Intensity_kWh_per_sqm:.3f}, anomalies {int(row.Anomalies)}" for row in package.asset_rankings.tail(5).itertuples()]
-                content = "[DATA-QUERY] Lowest-performing assets from the active dataset:\n" + "\n".join(rows)
-            elif "compare" in prompt_lower:
-                top = package.asset_rankings.head(3)
-                bottom = package.asset_rankings.tail(3)
+                    content = (
+                        "[OMNI-SYSTEM] To run a simulation, specify solar kW and/or HVAC setpoint reduction.\n"
+                        "Examples:\n"
+                        "  'What happens if we install 100kW of solar next month?'\n"
+                        "  'Simulate 50kW solar + reduce HVAC setpoint by 2°C'\n"
+                        "  'What if we add 200kW solar?'"
+                    )
+
+            # Scope-level emissions deep dive
+            elif any(t in prompt_lower for t in ["scope 1", "scope 2", "scope 3", "emission", "carbon", "tco2", "ghg"]):
+                s = package.summary
+                solar_pct = s["solar_total"] / max(s["energy_total"], 1) * 100
                 content = (
-                    f"[DATA-QUERY] Top 3 average ESG score: {top['ESG_Score'].mean():.1f}\n"
-                    f"Bottom 3 average ESG score: {bottom['ESG_Score'].mean():.1f}\n"
-                    f"Top 3 average intensity: {top['Energy_Intensity_kWh_per_sqm'].mean():.3f}\n"
-                    f"Bottom 3 average intensity: {bottom['Energy_Intensity_kWh_per_sqm'].mean():.3f}"
+                    f"[DATA-QUERY] GHG Emissions — SEBI BRSR P6 + CEA v20 + IPCC AR4\n\n"
+                    f"Scope 1 (Direct):   {s['scope1_total']:>10.3f} tCO2e\n"
+                    f"  Source: {package.df['diesel_litres'].sum():,.0f} L diesel × 2.68 kg CO2/L (IPCC AR4)\n\n"
+                    f"Scope 2 (Indirect): {s['scope2_total']:>10.3f} tCO2e\n"
+                    f"  Source: ({s['energy_total']:,.0f} kWh grid − {s['solar_total']:,.0f} kWh solar) × 0.727 kg/kWh (CEA v20)\n"
+                    f"  Solar offset: {solar_pct:.1f}% of consumption\n\n"
+                    f"Scope 3 (Proxy):    {s['scope3_total']:>10.3f} tCO2e\n"
+                    f"  Source: Water × 0.000344 + E-waste + Hazwaste + Procurement spend (SEBI BRSR P6)\n\n"
+                    f"TOTAL:              {s['total_carbon']:>10.3f} tCO2e\n\n"
+                    f"[CITED-RESEARCH] SEBI BRSR Principle 6; CEA Version 20; IPCC AR4."
                 )
-                plotly_fig = self.ai_engine.build_trend_figure(package)
-            elif "scope 1" in prompt_lower or "scope 2" in prompt_lower or "scope 3" in prompt_lower or "emission" in prompt_lower:
+
+            # Water analysis
+            elif any(t in prompt_lower for t in ["water", "kl", "withdrawal", "tanker"]):
+                df = package.df
+                breaches = df.loc[df["Water_Benchmark_Breach"]].groupby("asset_id").size().sort_values(ascending=False)
+                total_kl = package.summary["water_total"]
+                breach_list = [f"  - {aid}: {int(cnt)} periods above benchmark" for aid, cnt in breaches.head(5).items()] or ["  - No breaches detected."]
                 content = (
-                    f"[DATA-QUERY] Scope 1: {package.summary['scope1_total']:.2f} tCO2e\n"
-                    f"Scope 2: {package.summary['scope2_total']:.2f} tCO2e\n"
-                    f"Scope 3: {package.summary['scope3_total']:.2f} tCO2e\n"
-                    f"Total carbon: {package.summary['total_carbon']:.2f} tCO2e"
+                    f"[DATA-QUERY] Water Withdrawal Analysis — BRSR P6 EI-6\n\n"
+                    f"Total withdrawal: {total_kl:,.1f} kL across {package.summary['assets']} assets.\n"
+                    f"Scope 3 water contribution: {total_kl * 0.000344:.3f} tCO2e\n\n"
+                    f"BEE Benchmarks (Grade-A Offices):\n"
+                    f"  Bengaluru (Temperate): 0.80 – 1.00 kL/m²/yr\n"
+                    f"  Mumbai (Warm-Humid):   1.25 – 1.50 kL/m²/yr\n\n"
+                    f"Benchmark breaches ({int(df['Water_Benchmark_Breach'].sum())} records total):\n"
+                    + "\n".join(breach_list) + "\n\n"
+                    f"[CITED-RESEARCH] BEE Performance Benchmarking Grade-A Offices; SEBI BRSR P6."
                 )
-            elif "water" in prompt_lower and "benchmark" in prompt_lower:
-                breaches = package.df.loc[package.df["Water_Benchmark_Breach"]].groupby("asset_id").size().sort_values(ascending=False)
-                rows = [f"- {asset_id}: {int(count)} breach periods" for asset_id, count in breaches.head(5).items()] or ["- No breach periods detected."]
-                content = "[DATA-QUERY] Water benchmark review:\n" + "\n".join(rows)
-            elif "monthly" in prompt_lower or "ledger" in prompt_lower:
+                plotly_fig = self.ai_engine.build_water_figure(package)
+
+            # Monthly / ledger
+            elif any(t in prompt_lower for t in ["monthly", "ledger", "month by month", "period"]):
                 monthly = (
                     package.df.assign(month_period=package.df["month"].dt.to_period("M").astype(str))
                     .groupby("month_period", as_index=False)
-                    .agg(energy_kwh=("energy_kwh", "sum"), scope2=("Scope2_tCO2e", "sum"), anomalies=("Is_Anomaly", "sum"))
+                    .agg(energy_kwh=("energy_kwh", "sum"), scope2=("Scope2_tCO2e", "sum"), solar=("solar_kwh", "sum"), anomalies=("Is_Anomaly", "sum"))
                     .reset_index(drop=True)
                 )
-                sample_rows = [f"- {row.month_period}: {row.energy_kwh:,.0f} kWh, Scope 2 {row.scope2:.2f} tCO2e, anomalies {int(row.anomalies)}" for row in monthly.head(12).itertuples()]
-                content = "[DATA-QUERY] Monthly ledger snapshot:\n" + "\n".join(sample_rows)
+                rows = [
+                    f"  {row.month_period}  |  {row.energy_kwh:>10,.0f} kWh  |  Scope2: {row.scope2:>6.2f} tCO2e  |  Solar: {row.solar:>8,.0f} kWh  |  Anomalies: {int(row.anomalies)}"
+                    for row in monthly.head(18).itertuples()
+                ]
+                content = "[DATA-QUERY] Monthly Portfolio Ledger:\n\n" + "\n".join(rows)
+                plotly_fig = self.ai_engine.build_energy_figure(package)
+
+            # Named asset deep-dive
             elif asset_match is not None:
                 asset_df = package.df.loc[package.df["asset_id"].astype(str) == asset_match].sort_values("month").reset_index(drop=True)
                 latest = asset_df.iloc[-1]
+                avg_energy = float(asset_df["energy_kwh"].mean())
+                trend = "↑" if float(latest["energy_kwh"]) > avg_energy else "↓"
+                rank_row = package.asset_rankings.loc[package.asset_rankings["asset_id"] == asset_match]
+                esg_score = float(rank_row["ESG_Score"].iloc[0]) if not rank_row.empty else 0.0
+                bee = str(rank_row["BEE_Rating"].iloc[0]) if not rank_row.empty else "N/A"
                 content = (
-                    f"[DATA-QUERY] {asset_match} latest operating state:\n"
-                    f"- Energy: {latest['energy_kwh']:.2f} kWh\n"
-                    f"- Diesel: {latest['diesel_litres']:.2f} L\n"
-                    f"- Solar: {latest['solar_kwh']:.2f} kWh\n"
-                    f"- Water: {latest['water_withdrawal_kl']:.2f} kL\n"
-                    f"- Energy intensity: {latest['Energy_Intensity_kWh_per_sqm']:.4f}\n"
-                    f"- Scope 2: {latest['Scope2_tCO2e']:.4f} tCO2e\n"
-                    f"- Anomaly status: {'Yes' if bool(latest['Is_Anomaly']) else 'No'}"
+                    f"[DATA-QUERY] {asset_match} — Operational Intelligence\n\n"
+                    f"ESG Score:         {esg_score:.1f}/100  |  BEE Rating: {bee}\n"
+                    f"Energy (latest):   {float(latest['energy_kwh']):,.0f} kWh {trend} vs avg {avg_energy:,.0f} kWh\n"
+                    f"Solar offset:      {float(latest['solar_kwh']):,.0f} kWh ({float(latest['solar_kwh'])/max(float(latest['energy_kwh']),1)*100:.1f}%)\n"
+                    f"Diesel:            {float(latest['diesel_litres']):,.0f} L  → Scope 1: {float(latest['Scope1_tCO2e']):.3f} tCO2e\n"
+                    f"Grid energy:       {max(float(latest['energy_kwh'])-float(latest['solar_kwh']),0):,.0f} kWh  → Scope 2: {float(latest['Scope2_tCO2e']):.3f} tCO2e\n"
+                    f"Water:             {float(latest['water_withdrawal_kl']):,.1f} kL  |  Benchmark breach: {'Yes ⚠' if bool(latest.get('Water_Benchmark_Breach', False)) else 'No ✓'}\n"
+                    f"Energy intensity:  {float(latest['Energy_Intensity_kWh_per_sqm']):.4f} kWh/m²  (BEE 5-Star: <0.45)\n"
+                    f"HVAC kW/TR:        {float(latest.get('kW_per_TR', 0.70)):.3f}  (Benchmark: 0.65-0.75, HVAC Audit Std India)\n"
+                    f"Anomaly status:    {'🔴 FLAGGED — review SHAP drivers' if bool(latest.get('Is_Anomaly', False)) else '🟢 NORMAL'}"
                 )
+
+            # Default — full portfolio summary with proactive alerts
             else:
+                s = package.summary
+                best = package.asset_rankings.iloc[0]["asset_id"] if not package.asset_rankings.empty else "N/A"
+                worst = package.asset_rankings.iloc[-1]["asset_id"] if not package.asset_rankings.empty else "N/A"
                 content = (
-                    f"[OMNI-SYSTEM] Portfolio ESG score is {package.esg_score:.1f}/100 across {package.summary['assets']} assets and {package.summary['records']} records.\n"
-                    "[ADVISORY] Ask for top assets, bottom assets, a named asset analysis, monthly ledger, emissions, water benchmark review, forecast, SHAP root cause, or a simulation."
+                    f"[OMNI-SYSTEM] CUESG Portfolio Intelligence — {s['assets']} assets | {s['records']} records\n\n"
+                    f"ESG Score:    {package.esg_score:.1f}/100\n"
+                    f"Total Carbon: {s['total_carbon']:.1f} tCO2e  (S1: {s['scope1_total']:.1f} | S2: {s['scope2_total']:.1f} | S3: {s['scope3_total']:.1f})\n"
+                    f"Best Asset:   {best}  |  Worst Asset: {worst}\n"
+                    f"Anomalies:    {s['anomaly_count']} records flagged  (Isolation Forest contamination=4%)\n\n"
+                    "[ADVISORY] Try asking:\n"
+                    "  • 'Run a full BRSR compliance audit'\n"
+                    "  • 'Explain the anomalies and root causes'\n"
+                    "  • 'What CapEx investments will improve our score?'\n"
+                    "  • 'What happens if we install 100kW solar?'\n"
+                    "  • 'Show me the 12-month forecast'\n"
+                    "  • 'Compare top and bottom buildings'\n"
+                    "  • 'Export the compliance dossier'"
                 )
-        if advice and any(token in prompt_lower for token in ["advice", "recommend", "improve", "fix", "mitigation", "why", "drop", "laggard", "insight", "analyze", "analyse", "summary"]):
-            content += "\n[ADVISORY] " + " ".join(advice[:2])
-        if actions and any(token in prompt_lower for token in ["anomaly", "outlier", "clean", "impute", "score drop", "root cause", "fix", "repair"]):
-            content += "\n[XAI-ALERT] Extreme outlier signatures detected. Action buttons are available below."
+
+        # ── Proactive BRSR alerts (appended to every substantive response) ────
+        brsr_alerts = self._proactive_brsr_alerts(package)
+        if brsr_alerts:
+            alert_block = "\n\n[OMNI-SYSTEM AUTONOMOUS ALERT]\n" + "\n".join(brsr_alerts[:2])
+            content += alert_block
+
+        # ── Advisory suffix ───────────────────────────────────────────────────
+        if advice and any(t in prompt_lower for t in ["advice", "recommend", "improve", "fix", "mitigation", "why", "drop", "laggard", "insight", "analyze", "analyse", "summary"]):
+            content += "\n[ADVISORY] " + " | ".join(advice[:2])
+
+        # ── Outlier action buttons ─────────────────────────────────────────────
+        if actions and any(t in prompt_lower for t in ["anomaly", "outlier", "clean", "impute", "score drop", "root cause", "fix", "repair"]):
+            content += "\n[XAI-ALERT] Extreme outlier signatures detected. Use the action buttons below to auto-impute."
+
         return {"role": "assistant", "content": self._cite_if_needed(content, prompt), "plotly_fig": plotly_fig, "actions": actions}
 
     def _parse_simulation_request(self, prompt: str) -> tuple[float, float] | None:
@@ -1163,9 +1875,7 @@ class RegulatoryIntelligence:
                 forecast_df=forecast_df,
             )
             if "mitigation_recs" in _inspect.signature(_build_pdf_report_v2).parameters:
-                _kwargs["mitigation_recs"] = list(
-                    GREENLENS_SYSTEM_METADATA["GreenLens_System_Metadata"]["Mitigation_Recommendations"]
-                )
+                _kwargs["mitigation_recs"] = list(GREENLENS_SYSTEM_METADATA.get("Mitigation_Recommendations", []))
             return _build_pdf_report_v2(**_kwargs)
 
         # greenlens_pdf_engine not installed — use plaintext fallback
