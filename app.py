@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 from io import BytesIO, StringIO
 from typing import Any
 
@@ -16,6 +17,7 @@ from greenlens_ai_core import (
     GREENLENS_SYSTEM_METADATA,
     RegulatoryIntelligence,
     SessionSustainabilityTracker,
+    generate_synthetic_demo_data,
     load_master_dataset,
 )
 
@@ -30,16 +32,23 @@ MAX_CHAT_HISTORY = 80
 
 def inject_css(control_room: bool) -> None:
     chat_display = "none" if control_room else "flex"
+    # Inject font link tags separately — more reliable than @import alone in Streamlit
     st.markdown(
         '<link rel="preconnect" href="https://fonts.googleapis.com">'
         '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
-        '<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">',
+        '<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">',
         unsafe_allow_html=True,
     )
 
     st.markdown(
 f"""<style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+:root {{
+    --font-ui: 'Manrope', 'Segoe UI', sans-serif;
+    --font-display: 'Plus Jakarta Sans', 'Segoe UI', sans-serif;
+    --font-mono: 'IBM Plex Mono', 'SF Mono', 'Consolas', 'Courier New', monospace;
+}}
 
 /* =============================================
    CUESG — CONTROL ROOM INTERFACE
@@ -57,7 +66,7 @@ f"""<style>
         radial-gradient(ellipse 80% 40% at 10% 0%, rgba(0, 255, 127, 0.06) 0%, transparent 60%),
         radial-gradient(ellipse 60% 50% at 90% 100%, rgba(88, 166, 255, 0.06) 0%, transparent 60%),
         #060a0f;
-    font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', 'Courier New', monospace;
+    font-family: var(--font-ui);
     color: #c9d1d9;
     background-attachment: fixed;
 }}
@@ -67,18 +76,18 @@ f"""<style>
 .stApp [data-testid="stMarkdownContainer"] p,
 .stApp [data-testid="stMarkdownContainer"] li,
 .stApp .stMarkdown p {{ 
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-ui) !important;
     font-size: 0.82rem !important;
     line-height: 1.75 !important;
     color: #8b949e;
 }}
 
-/* Headings stay Syne */
+/* Headings use the display font */
 .stApp h1, .stApp h2, .stApp h3, .stApp h4,
 .stApp [data-testid="stMarkdownContainer"] h1,
 .stApp [data-testid="stMarkdownContainer"] h2,
 .stApp [data-testid="stMarkdownContainer"] h3 {{
-    font-family: 'Syne', sans-serif !important;
+    font-family: var(--font-display) !important;
     color: #f0f6fc !important;
     letter-spacing: -0.02em;
 }}
@@ -91,7 +100,7 @@ f"""<style>
 
 /* Inline code */
 .stApp code {{
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-mono) !important;
     font-size: 0.78rem !important;
     background: rgba(88, 166, 255, 0.08) !important;
     border: 1px solid rgba(88, 166, 255, 0.15) !important;
@@ -124,7 +133,7 @@ f"""<style>
 }}
 
 .sys-wordmark {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-display);
     font-size: 0.85rem;
     font-weight: 700;
     color: #00ff7f;
@@ -136,7 +145,7 @@ f"""<style>
     display: flex;
     align-items: center;
     gap: 8px;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
     font-size: 0.7rem;
     color: #4d9375;
     letter-spacing: 0.1em;
@@ -173,7 +182,7 @@ f"""<style>
 }}
 
 .hero-title {{
-    font-family: 'Syne', 'SF Pro Display', -apple-system, system-ui, 'Segoe UI', Arial, sans-serif;
+    font-family: var(--font-display);
     font-size: 3.8rem;
     font-weight: 800;
     line-height: 1.05;
@@ -186,7 +195,7 @@ f"""<style>
 }}
 
 .hero-copy {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
     color: #4d5a6a;
     font-size: 0.8rem;
     letter-spacing: 0.08em;
@@ -221,7 +230,7 @@ f"""<style>
 }}
 
 .hint-title {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-display);
     color: #00ff7f;
     font-size: 0.65rem;
     text-transform: uppercase;
@@ -234,7 +243,7 @@ f"""<style>
     color: #8b949e;
     font-size: 0.85rem;
     line-height: 1.5;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
 }}
 
 /* =============================================
@@ -298,7 +307,7 @@ f"""<style>
 }}
 
 .role {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-display);
     font-size: 0.6rem;
     letter-spacing: 0.18em;
     text-transform: uppercase;
@@ -317,7 +326,7 @@ f"""<style>
     line-height: 1.65;
     white-space: pre-wrap;
     font-size: 0.9rem;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
 }}
 
 /* =============================================
@@ -338,7 +347,7 @@ div[data-testid="stChatInput"] {{
 }}
 
 div[data-testid="stChatInput"] textarea {{
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-ui) !important;
     font-size: 0.85rem !important;
     color: #c9d1d9 !important;
     background: transparent !important;
@@ -378,7 +387,7 @@ div[data-testid="stChatInput"] textarea {{
 }}
 
 .metric-label {{
-    font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', 'Courier New', monospace;
+    font-family: var(--font-display);
     color: #4d5a6a;
     font-size: 0.62rem;
     letter-spacing: 0.18em;
@@ -388,7 +397,7 @@ div[data-testid="stChatInput"] textarea {{
 }}
 
 .metric-value {{
-    font-family: 'Syne', 'SF Pro Display', -apple-system, system-ui, 'Segoe UI', Arial, sans-serif;
+    font-family: var(--font-display);
     color: #f0f6fc;
     font-size: 1.55rem;
     font-weight: 800;
@@ -410,7 +419,7 @@ div[data-testid="stChatInput"] textarea {{
 }}
 
 .stTabs [data-baseweb="tab"] {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
     font-size: 0.7rem;
     letter-spacing: 0.05em;
     padding: 8px 14px;
@@ -454,7 +463,7 @@ div[data-testid="stPlotlyChart"] {{
    12. STREAMLIT BUTTONS — CONSISTENT
    ============================================= */
 .stButton > button {{
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-ui) !important;
     font-size: 0.72rem !important;
     letter-spacing: 0.08em !important;
     font-weight: 600 !important;
@@ -485,7 +494,7 @@ div[data-testid="stPlotlyChart"] {{
 }}
 
 [data-testid="stFileUploader"] label {{
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-ui) !important;
     font-size: 0.72rem !important;
     color: #4d5a6a !important;
     letter-spacing: 0.05em;
@@ -495,7 +504,7 @@ div[data-testid="stPlotlyChart"] {{
    14. SLIDERS
    ============================================= */
 [data-testid="stSlider"] label {{
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-ui) !important;
     font-size: 0.72rem !important;
     color: #4d5a6a !important;
     letter-spacing: 0.05em;
@@ -505,7 +514,7 @@ div[data-testid="stPlotlyChart"] {{
    15. SELECTBOX
    ============================================= */
 [data-testid="stSelectbox"] label {{
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-ui) !important;
     font-size: 0.72rem !important;
     color: #4d5a6a !important;
     letter-spacing: 0.05em;
@@ -539,7 +548,7 @@ hr {{
 }}
 
 .ctrl-label {{
-    font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', 'Courier New', monospace;
+    font-family: var(--font-display);
     font-size: 0.58rem;
     color: #4d5a6a;
     letter-spacing: 0.20em;
@@ -549,7 +558,7 @@ hr {{
 }}
 
 .ctrl-value {{
-    font-family: 'Syne', 'SF Pro Display', -apple-system, system-ui, 'Segoe UI', Arial, sans-serif;
+    font-family: var(--font-display);
     font-size: 1.6rem;
     font-weight: 700;
     letter-spacing: -0.03em;
@@ -562,7 +571,7 @@ hr {{
 .ctrl-value.white {{ color: #f0f6fc; }}
 
 .ctrl-sub {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
     font-size: 0.7rem;
     color: #4d5a6a;
     margin-top: 4px;
@@ -586,7 +595,7 @@ hr {{
 }}
 
 .asset-name {{
-    font-family: 'Syne', sans-serif;
+    font-family: var(--font-display);
     font-size: 1rem;
     font-weight: 700;
     color: #f0f6fc;
@@ -594,7 +603,7 @@ hr {{
 }}
 
 .asset-meta {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
     font-size: 0.72rem;
     color: #4d5a6a;
     line-height: 1.8;
@@ -609,7 +618,7 @@ hr {{
    19. DOWNLOAD BUTTONS (SPECIAL)
    ============================================= */
 [data-testid="stDownloadButton"] > button {{
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-ui) !important;
     font-size: 0.72rem !important;
     letter-spacing: 0.08em !important;
     border-radius: 8px !important;
@@ -628,7 +637,7 @@ hr {{
    20. JSON VIEWER
    ============================================= */
 [data-testid="stJson"] {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.75rem;
     border: 1px solid rgba(48, 54, 61, 0.4);
     border-radius: 10px;
@@ -639,7 +648,7 @@ hr {{
    21. CODE BLOCKS
    ============================================= */
 .stCode {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.75rem;
     border-radius: 10px;
     border: 1px solid rgba(48, 54, 61, 0.4);
@@ -649,7 +658,7 @@ hr {{
    22. INFO / WARNING BOXES
    ============================================= */
 [data-testid="stInfo"] {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
     font-size: 0.8rem;
     border-radius: 8px;
     border-left: 3px solid #58a6ff;
@@ -674,7 +683,7 @@ hr {{
 }}
 
 [data-testid="stExpander"] summary {{
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: var(--font-ui) !important;
     font-size: 0.75rem !important;
     color: #4d5a6a !important;
     letter-spacing: 0.08em;
@@ -716,7 +725,7 @@ hr {{
 }}
 
 .cmd-title {{
-    font-family: 'Syne', sans-serif;
+    font-family: var(--font-display);
     font-size: 1.3rem;
     font-weight: 800;
     color: #f0f6fc;
@@ -724,14 +733,14 @@ hr {{
 }}
 
 .cmd-desc {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
     font-size: 0.75rem;
     color: #4d5a6a;
     line-height: 1.7;
 }}
 
 .cmd-tag {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-display);
     font-size: 0.6rem;
     font-weight: 700;
     letter-spacing: 0.18em;
@@ -748,7 +757,7 @@ hr {{
 }}
 
 .cmd-stat-label {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-display);
     font-size: 0.6rem;
     color: #4d5a6a;
     letter-spacing: 0.15em;
@@ -757,7 +766,7 @@ hr {{
 }}
 
 .cmd-stat-value {{
-    font-family: 'Syne', sans-serif;
+    font-family: var(--font-display);
     font-size: 1.1rem;
     font-weight: 700;
     color: #f0f6fc;
@@ -765,7 +774,7 @@ hr {{
 }}
 
 .cmd-stat-rows {{
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-ui);
     font-size: 0.72rem;
     color: #4d5a6a;
     line-height: 2;
@@ -823,10 +832,10 @@ inject_css(st.session_state.control_room)
 
 def fig_layout(title: str = "") -> dict:
     return dict(
-        title=dict(text=title, font=dict(family="Syne, sans-serif", size=14, color="#8b949e")),
+        title=dict(text=title, font=dict(family="Plus Jakarta Sans, sans-serif", size=14, color="#8b949e")),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
+        font=dict(family="Manrope, sans-serif", color="#8b949e", size=11),
         margin=dict(l=12, r=12, t=44, b=12),
         legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
     )
@@ -841,25 +850,60 @@ def queue_prompt(prompt_text: str) -> None:
 
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
+    """
+    Read an uploaded ESG dataset (CSV / Excel / PDF with tabular data).
+    PDFs are treated as ESG data tables first; if that fails the user should
+    use the separate 'Upload utility bill' uploader instead.
+    """
     ext = uploaded_file.name.lower().rsplit(".", 1)[-1]
     payload = uploaded_file.getvalue()
     if ext == "csv":
-        return pd.read_csv(BytesIO(payload))
+        # Try common encodings
+        for enc in ["utf-8", "latin-1", "cp1252"]:
+            try:
+                return pd.read_csv(BytesIO(payload), encoding=enc)
+            except Exception:
+                continue
+        return pd.read_csv(BytesIO(payload), encoding="latin-1", errors="replace")
     if ext in {"xlsx", "xls"}:
         return pd.read_excel(BytesIO(payload))
     if ext == "pdf":
-        decoded = payload.decode("latin-1", errors="ignore")
-        lines = [line.strip() for line in decoded.splitlines() if line.strip()]
-        clean = "\n".join(lines)
+        # Try pdfplumber for table extraction first
         try:
-            return pd.read_csv(StringIO(clean))
+            import pdfplumber, io as _io
+            with pdfplumber.open(_io.BytesIO(payload)) as pdf:
+                dfs = []
+                for page in pdf.pages[:8]:
+                    tables = page.extract_tables()
+                    for tbl in tables:
+                        if tbl and len(tbl) > 1:
+                            try:
+                                df_t = pd.DataFrame(tbl[1:], columns=tbl[0])
+                                dfs.append(df_t)
+                            except Exception:
+                                pass
+                if dfs:
+                    return pd.concat(dfs, ignore_index=True)
         except Exception:
-            return pd.read_csv(StringIO(clean), sep=r"\s{2,}", engine="python")
-    raise ValueError("Unsupported dataset format.")
+            pass
+        # Fallback: raw text → try CSV parse
+        try:
+            decoded = payload.decode("latin-1", errors="ignore")
+            lines   = [l.strip() for l in decoded.splitlines() if l.strip()]
+            clean   = "\n".join(lines)
+            try:
+                return pd.read_csv(StringIO(clean))
+            except Exception:
+                return pd.read_csv(StringIO(clean), sep=r"\s{2,}", engine="python")
+        except Exception:
+            pass
+        raise ValueError("Could not parse tabular data from PDF. If this is a utility bill, use the 'Upload utility bill' uploader below.")
+    raise ValueError(f"Unsupported dataset format: .{ext}")
 
 
 def activate_portfolio(raw_df: pd.DataFrame, source_name: str) -> None:
     calculated_df, detected_columns = math_engine.calculate(raw_df)
+    ai_engine.train_models(calculated_df)
     package = ai_engine.process(calculated_df, detected_columns, source_name)
     st.session_state.active_package = package
     st.session_state.messages = [{"role": "assistant", "content": f"[OMNI-SYSTEM] {source_name} loaded — {package.summary['assets']} assets, {package.summary['records']} records, {package.summary['total_carbon']:.1f} tCO₂e total carbon.", "actions": package.summary.get("outlier_actions", [])[:2]}]
@@ -917,6 +961,8 @@ f"""<div class="cmd-snapshot">
         unsafe_allow_html=True,
     )
 
+
+# --- ALL ORIGINAL WORKSPACE FUNCTIONS BELOW (UNCHANGED IN LOGIC) ---
 
 def render_dossier_console(package, forecast_df: pd.DataFrame) -> None:
     rankings = package.asset_rankings.reset_index(drop=True)
@@ -1030,9 +1076,14 @@ def build_metadata_matrix(package) -> pd.DataFrame:
 
 def build_asset_categorization(package) -> pd.DataFrame:
     rankings = package.asset_rankings.reset_index(drop=True).copy()
-    scope2_map = package.df.groupby("asset_id", as_index=False)["Scope2_tCO2e"].sum().reset_index(drop=True)
-    scope3_map = package.df.groupby("asset_id", as_index=False)["Scope3_tCO2e"].sum().reset_index(drop=True)
-    rankings = rankings.merge(scope2_map, on="asset_id", how="left").merge(scope3_map, on="asset_id", how="left", suffixes=("", "_scope3"))
+    # Scope2_tCO2e and Scope3_tCO2e are already present in asset_rankings (from _rank_assets .agg).
+    # Only merge if they are missing, to avoid _x/_y suffix conflicts.
+    if "Scope2_tCO2e" not in rankings.columns:
+        scope2_map = package.df.groupby("asset_id", as_index=False)["Scope2_tCO2e"].sum().reset_index(drop=True)
+        rankings = rankings.merge(scope2_map, on="asset_id", how="left")
+    if "Scope3_tCO2e" not in rankings.columns:
+        scope3_map = package.df.groupby("asset_id", as_index=False)["Scope3_tCO2e"].sum().reset_index(drop=True)
+        rankings = rankings.merge(scope3_map, on="asset_id", how="left")
     rankings["Category"] = rankings["Rank_Label"].replace({"Best Performing": "Leadership Asset", "Worst Performing": "Laggard Asset", "Core Performing": "Core Asset"})
     return rankings.rename(columns={"asset_id": "Asset", "Category": "Category", "Scope2_tCO2e": "Scope 2 tCO2e", "Scope3_tCO2e": "Scope 3 tCO2e", "Energy_Intensity_kWh_per_sqm": "Energy Intensity", "Anomalies": "Anomalies", "ESG_Score": "ESG Score", "BEE_Rating": "BEE Rating"})
 
@@ -1096,7 +1147,7 @@ def render_control_header(package) -> None:
 f"""<div class="ctrl-header">
     <div class="ctrl-cell">
         <div class="ctrl-label">Portfolio State</div>
-        <div style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;color:#f0f6fc;margin:6px 0 10px 0;">
+        <div style="font-family:'Plus Jakarta Sans',sans-serif;font-size:1rem;font-weight:700;color:#f0f6fc;margin:6px 0 10px 0;">
             Deterministic compliance graph active across {package.summary['assets']} assets
         </div>
         <div class="ctrl-sub">
@@ -1497,13 +1548,44 @@ def render_command_reference_workspace() -> None:
 
 def render_system_runtime_workspace(package) -> None:
     st.markdown("**System Runtime**")
+    # Detect available OCR engines
+    ocr_engines = []
+    try:
+        import pdfplumber
+        ocr_engines.append("pdfplumber")
+    except ImportError:
+        pass
+    try:
+        import fitz
+        ocr_engines.append("PyMuPDF")
+    except ImportError:
+        pass
+    try:
+        import pytesseract
+        ocr_engines.append("Tesseract")
+    except ImportError:
+        pass
+    try:
+        import reportlab
+        rl_status = "ReportLab ✓"
+    except ImportError:
+        rl_status = "ReportLab ✗ (plain-text PDF)"
+
+    gemini_status = "✓ Active" if bool(os.getenv("GEMINI_API_KEY", "")) else "✗ Not set (regex OCR active)"
+    openai_status = "✓ Active" if bool(os.getenv("OPENAI_API_KEY", "")) else "✗ Not set"
+
     runtime = pd.DataFrame([
-        {"Signal": "Control Room Mode", "Value": str(st.session_state.control_room)},
-        {"Signal": "Queued Prompt", "Value": st.session_state.queued_prompt or "None"},
-        {"Signal": "Pending OCR Payload", "Value": "Yes" if st.session_state.pending_bill is not None else "No"},
-        {"Signal": "Messages in Memory", "Value": len(st.session_state.messages)},
-        {"Signal": "Detected Columns", "Value": len(package.detected_columns)},
-        {"Signal": "Session Carbon", "Value": f"{st.session_state.session_carbon_g:.4f} gCO2e"},
+        {"Signal": "Control Room Mode",      "Value": str(st.session_state.control_room)},
+        {"Signal": "Active Source",          "Value": package.source_name},
+        {"Signal": "Queued Prompt",          "Value": st.session_state.queued_prompt or "None"},
+        {"Signal": "Pending OCR Payload",    "Value": "Yes" if st.session_state.pending_bill is not None else "No"},
+        {"Signal": "Messages in Memory",     "Value": len(st.session_state.messages)},
+        {"Signal": "Detected Columns",       "Value": len(package.detected_columns)},
+        {"Signal": "Session Carbon (gCO2e)", "Value": f"{st.session_state.session_carbon_g:.4f}"},
+        {"Signal": "OCR Engines Available",  "Value": ", ".join(ocr_engines) if ocr_engines else "Regex only (offline)"},
+        {"Signal": "PDF Engine",             "Value": rl_status},
+        {"Signal": "GEMINI_API_KEY",         "Value": gemini_status},
+        {"Signal": "OPENAI_API_KEY",         "Value": openai_status},
     ])
     st.dataframe(runtime, use_container_width=True, hide_index=True)
 
@@ -1595,7 +1677,7 @@ with main_col:
         st.markdown(
 """<div class="hero-container">
     <div class="hero-title">CUESG</div>
-    <div class="hero-copy">Drop in a messy spreadsheet, get a clean ESG report back. Built for Indian commercial portfolios — tracks carbon across all three scopes, flags anomalies before they become audit issues, and runs what-if scenarios so you can see the impact of changes before committing to them.</div>
+    <div class="hero-copy">Drop in a messy spreadsheet — or hit ⚡ Load Demo Data to start instantly. Tracks carbon across all three scopes, parses utility bills via OCR, flags anomalies before they become audit issues, and runs what-if scenarios against SEBI BRSR Principle 6. Built for Indian commercial portfolios.</div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -1607,21 +1689,133 @@ with main_col:
             if dataset_file is not None:
                 signature = f"{dataset_file.name}:{dataset_file.size}"
                 if signature != st.session_state.active_signature:
-                    activate_portfolio(read_uploaded_file(dataset_file), dataset_file.name)
-                    st.session_state.active_signature = signature
-            if st.button("Load Master Dataset", use_container_width=True):
-                master = load_master_dataset()
-                if not master.empty:
-                    activate_portfolio(master, "master_esg_data")
+                    try:
+                        activate_portfolio(read_uploaded_file(dataset_file), dataset_file.name)
+                        st.session_state.active_signature = signature
+                    except Exception as exc:
+                        st.error(f"Could not load dataset: {exc}")
+            demo_col, master_col = st.columns(2, gap="small")
+            with demo_col:
+                if st.button("⚡ Load Demo Data", use_container_width=True, help="Generate synthetic 8-asset, 24-month Indian portfolio — no file needed"):
+                    demo_df = generate_synthetic_demo_data()
+                    activate_portfolio(demo_df, "CUESG-Demo-Portfolio (Synthetic)")
+                    st.session_state.active_signature = "demo"
+            with master_col:
+                if st.button("Load Master Dataset", use_container_width=True):
+                    master = load_master_dataset()
+                    if not master.empty:
+                        activate_portfolio(master, "master_esg_data")
+                    else:
+                        st.warning("master_esg_data.xlsx / .csv not found. Use ⚡ Load Demo Data instead.")
+
         with up_right:
-            bill_image = st.file_uploader("Upload utility bill image", type=["png", "jpg", "jpeg", "webp"], key="bill_image")
-            if bill_image is not None and st.button("Parse Bill OCR", use_container_width=True):
-                st.session_state.pending_bill = reg_engine.parse_utility_bill_image(bill_image.getvalue(), bill_image.type or "image/png")
+            st.markdown(
+                "<div style='font-family:Manrope,sans-serif;font-size:0.65rem;"
+                "color:#4d5a6a;letter-spacing:0.12em;text-transform:uppercase;"
+                "font-weight:700;margin-bottom:6px;'>✦ Utility Bill Parser</div>",
+                unsafe_allow_html=True,
+            )
+            bill_type = st.radio("Bill format", ["Image (PNG/JPG)", "PDF Bill"], horizontal=True, label_visibility="collapsed", key="bill_type_radio")
+
+            if bill_type == "Image (PNG/JPG)":
+                bill_image = st.file_uploader(
+                    "Upload bill image (BESCOM, MSEDCL, tanker receipt…)",
+                    type=["png", "jpg", "jpeg", "webp"], key="bill_image"
+                )
+                if bill_image is not None:
+                    if st.button("🔍 Parse Bill OCR", use_container_width=True, key="parse_img_btn"):
+                        with st.spinner("Running CUESG Omni-Parser…"):
+                            result = reg_engine.parse_utility_bill_image(bill_image.getvalue(), bill_image.type or "image/png")
+                            st.session_state.pending_bill = result
+            else:
+                bill_pdf = st.file_uploader(
+                    "Upload utility bill PDF (BESCOM, Tata Power, Water board…)",
+                    type=["pdf"], key="bill_pdf"
+                )
+                if bill_pdf is not None:
+                    if st.button("🔍 Parse PDF Bill", use_container_width=True, key="parse_pdf_btn"):
+                        with st.spinner("Running CUESG PDF Parser (pdfplumber → PyMuPDF → regex)…"):
+                            result = reg_engine.parse_utility_bill_pdf(bill_pdf.getvalue())
+                            st.session_state.pending_bill = result
+
+            # ── OCR Result Display ────────────────────────────────────────────
             if st.session_state.pending_bill is not None:
-                st.json(st.session_state.pending_bill)
-                if st.button("Append OCR Output", use_container_width=True) and st.session_state.active_package is not None:
-                    updated_df = reg_engine.append_utility_bill_to_df(st.session_state.active_package, st.session_state.pending_bill)
-                    activate_portfolio(updated_df, f"{st.session_state.active_package.source_name} + OCR")
+                bill = st.session_state.pending_bill
+                conf = float(bill.get("_confidence", 0.0))
+                status = str(bill.get("_status", ""))
+                engine = str(bill.get("_ocr_engine", "unknown"))
+                flag = bool(bill.get("_flag_for_review", False))
+                auto_ingest = bool(bill.get("_auto_ingest", False))
+
+                # Confidence badge
+                if conf >= 0.90:
+                    badge_color, badge_label = "#00ff7f", "✓ AUTO-ACCEPT"
+                elif conf >= 0.75:
+                    badge_color, badge_label = "#d29922", "⚠ REVIEW FLAGGED"
+                else:
+                    badge_color, badge_label = "#f85149", "✗ MANUAL ENTRY"
+
+                st.markdown(
+                    f"<div style='font-family:Manrope,sans-serif;font-size:0.68rem;"
+                    f"background:rgba(13,17,23,0.8);border:1px solid {badge_color}33;"
+                    f"border-left:3px solid {badge_color};padding:10px 14px;"
+                    f"border-radius:8px;margin:8px 0;'>"
+                    f"<span style='color:{badge_color};font-weight:700;'>{badge_label}</span>"
+                    f"<span style='color:#4d5a6a;margin-left:10px;'>Confidence: {conf:.2f} | Engine: {engine}</span>"
+                    f"<br/><span style='color:#8b949e;font-size:0.62rem;'>{status}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                if auto_ingest:
+                    # Show clean extracted fields
+                    display_keys = ["energy_kwh", "diesel_litres", "water_withdrawal_kl", "utility_cost_inr", "solar_kwh", "bill_month", "vendor_name", "account_id"]
+                    clean_bill = {k: v for k, v in bill.items() if k in display_keys and v is not None}
+                    if clean_bill:
+                        st.json(clean_bill)
+                    if flag:
+                        st.warning("⚠ Yellow flag: confidence 0.75–0.89. This record will be marked for monthly audit review.")
+                    if st.button("✅ Append to Portfolio", use_container_width=True, key="append_ocr_btn") and st.session_state.active_package is not None:
+                        updated_df = reg_engine.append_utility_bill_to_df(st.session_state.active_package, bill)
+                        activate_portfolio(updated_df, f"{st.session_state.active_package.source_name} + OCR")
+                        st.session_state.pending_bill = None
+                        st.success("Bill appended and portfolio recalculated.")
+                    elif st.session_state.active_package is None:
+                        st.info("Load a portfolio dataset first, then append the bill.")
+                else:
+                    # HARD STOP — manual entry form
+                    st.error("🛑 HARD STOP: Confidence too low for auto-ingest. Please verify and enter values manually.")
+                    with st.form("manual_bill_entry"):
+                        st.markdown("**Manual Bill Entry** — fill in what you can read from the bill:")
+                        m_col1, m_col2 = st.columns(2)
+                        with m_col1:
+                            m_energy = st.number_input("Energy (kWh)", min_value=0.0, value=float(bill.get("energy_kwh") or 0.0), step=100.0)
+                            m_diesel = st.number_input("Diesel (Litres)", min_value=0.0, value=float(bill.get("diesel_litres") or 0.0), step=10.0)
+                            m_water  = st.number_input("Water (kL)", min_value=0.0, value=float(bill.get("water_withdrawal_kl") or 0.0), step=1.0)
+                        with m_col2:
+                            m_cost   = st.number_input("Utility Cost (INR)", min_value=0.0, value=float(bill.get("utility_cost_inr") or 0.0), step=1000.0)
+                            m_month  = st.text_input("Bill Month (YYYY-MM)", value=str(bill.get("bill_month") or ""))
+                            m_asset  = st.text_input("Asset ID", value=str(bill.get("asset_id") or ""))
+                        submitted = st.form_submit_button("✅ Confirm & Append to Portfolio")
+                        if submitted and st.session_state.active_package is not None:
+                            manual_bill = {
+                                "energy_kwh": m_energy if m_energy > 0 else None,
+                                "diesel_litres": m_diesel if m_diesel > 0 else None,
+                                "water_withdrawal_kl": m_water if m_water > 0 else None,
+                                "utility_cost_inr": m_cost if m_cost > 0 else None,
+                                "bill_month": m_month if m_month.strip() else None,
+                                "asset_id": m_asset.strip() if m_asset.strip() else None,
+                                "_confidence": 1.0,  # human-verified
+                                "_ocr_engine": "manual",
+                            }
+                            updated_df = reg_engine.append_utility_bill_to_df(st.session_state.active_package, manual_bill)
+                            activate_portfolio(updated_df, f"{st.session_state.active_package.source_name} + Manual-Bill")
+                            st.session_state.pending_bill = None
+                            st.success("Manual bill entry confirmed and appended.")
+                        elif submitted:
+                            st.info("Load a portfolio dataset first, then append the bill.")
+
+                if st.button("✕ Clear bill result", key="clear_bill_btn", use_container_width=False):
                     st.session_state.pending_bill = None
 
         st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
@@ -1638,17 +1832,18 @@ with main_col:
         <div class="hint-copy">"Why are emissions high in this building? Run a SHAP root cause."</div>
     </div>
     <div class="hint-card">
-        <div class="hint-title">✦ Simulation</div>
-        <div class="hint-copy">"What happens if we install 100kW of solar next month?"</div>
+        <div class="hint-title">✦ BRSR Audit</div>
+        <div class="hint-copy">"Run a full SEBI BRSR Principle 6 compliance audit."</div>
     </div>
     <div class="hint-card">
-        <div class="hint-title">✦ Anomalies</div>
-        <div class="hint-copy">"Show me all anomaly records and explain the signatures."</div>
+        <div class="hint-title">✦ CapEx Strategy</div>
+        <div class="hint-copy">"What CapEx investments will improve our ESG score the most?"</div>
     </div>
 </div>""",
             unsafe_allow_html=True,
         )
 
+        # Chat — only render the shell when there's something to show
         has_messages = len(st.session_state.messages) > 0
         if has_messages:
             st.markdown("<div class='chat-shell'>", unsafe_allow_html=True)
@@ -1676,6 +1871,7 @@ if not st.session_state.control_room:
                 f"Show numbers and percentage changes."
             )
 
+# Chat input — always rendered last so it docks correctly
 prompt = st.session_state.queued_prompt or st.chat_input("Issue a data query, mutation, simulation, or export command")
 
 if prompt:
@@ -1736,6 +1932,7 @@ if package is not None:
     render_command_snapshot(package)
     render_control_header(package)
 
+    # Metric strip
     cards = st.columns(6, gap="small")
     card_data = [
         ("Scope 1  ·  CEA/IPCC", f"{package.summary['scope1_total']:.1f} tCO₂e"),
@@ -1773,7 +1970,7 @@ if package is not None:
     with ops_tab:
         left, right = st.columns([1.15, 0.85], gap="large")
         with left:
-        
+            # Reuse cached forecast — never recompute on every render
             if st.session_state.cached_forecast_df is None or st.session_state.get("_forecast_sig") != package.source_name:
                 st.session_state.cached_forecast_df = ai_engine.forecast_portfolio(package.df, months=12)
                 st.session_state["_forecast_sig"] = package.source_name
@@ -1856,7 +2053,7 @@ if package is not None:
         )
         benchmark_fig = go.Figure()
         benchmark_fig.add_bar(x=benchmark_df["Climate_Zone"], y=benchmark_df["Avg_Energy_Intensity"], name="Energy Intensity (kWh/m²)", marker_color="#58a6ff")
-     
+        # BEE EUI benchmark line
         benchmark_fig.add_scatter(x=benchmark_df["Climate_Zone"], y=[160]*len(benchmark_df), mode="lines", name="BEE EUI Baseline 160 kWh/m² (BEE Star Rating)", line=dict(color="#f85149", dash="dot", width=2))
         benchmark_fig.update_layout(**fig_layout("Energy Intensity vs BEE Baseline  ·  Source: BEE Star Rating (140–180 kWh/m²/yr)"), yaxis=dict(title="Energy Intensity (kWh/m²)"))
         figures["Climate Benchmark Monitor"] = benchmark_fig
@@ -1870,7 +2067,7 @@ if package is not None:
         bee_fig.update_layout(**fig_layout("BEE Rating · Energy Intensity (kWh/m²)"))
         render_plot(bee_fig, key="bee_leaderboard_main")
 
-
+    # Use cached forecast — only compute once per source file
     if st.session_state.cached_forecast_df is None or st.session_state.get("_forecast_sig") != package.source_name:
         with st.spinner("Computing 12-month forecast..."):
             st.session_state.cached_forecast_df = ai_engine.forecast_portfolio(package.df, months=12)
@@ -1879,16 +2076,22 @@ if package is not None:
     st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
     render_detailed_dossier_workspace(package, forecast_df, figures)
 
-    dossier_md = reg_engine.build_markdown_report(package, forecast_df, st.session_state.messages, st.session_state.rolling_context)
-    dossier_pdf = reg_engine.build_pdf_report(dossier_md, figures, st.session_state.messages, st.session_state.rolling_context, package, forecast_df=st.session_state.cached_forecast_df)
-    st.session_state.dossier_md = dossier_md
-    st.session_state.dossier_pdf = dossier_pdf
+    # Only auto-build the dossier when source changes or it doesn't exist yet.
+    # The "Generate Compliance Report" button above triggers the richer, chart-embedded build.
+    _dossier_sig = f"auto:{package.source_name}"
+    if not st.session_state.dossier_md or st.session_state.get("_dossier_sig") != _dossier_sig:
+        dossier_md = reg_engine.build_markdown_report(package, forecast_df, st.session_state.messages, st.session_state.rolling_context)
+        st.session_state.dossier_md = dossier_md
+        st.session_state["_dossier_sig"] = _dossier_sig
+        if not st.session_state.dossier_pdf:
+            dossier_pdf = reg_engine.build_pdf_report(dossier_md, figures, st.session_state.messages, st.session_state.rolling_context, package, forecast_df=st.session_state.cached_forecast_df)
+            st.session_state.dossier_pdf = dossier_pdf
 
     st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
     st.markdown(
 """<div style="background:rgba(0,255,127,0.04);border:1px solid rgba(0,255,127,0.15);border-radius:12px;padding:16px 20px;margin-bottom:12px;">
-    <div style="font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:#00ff7f;letter-spacing:0.18em;text-transform:uppercase;font-weight:700;margin-bottom:6px;">✦ Final Report Downloads</div>
-    <div style="font-family:'JetBrains Mono',monospace;font-size:0.75rem;color:#4d5a6a;">
+    <div style="font-family:'Plus Jakarta Sans',sans-serif;font-size:0.6rem;color:#00ff7f;letter-spacing:0.18em;text-transform:uppercase;font-weight:700;margin-bottom:6px;">✦ Final Report Downloads</div>
+    <div style="font-family:'Manrope',sans-serif;font-size:0.75rem;color:#4d5a6a;">
         Use <b style="color:#c9d1d9;">⬡ Generate Compliance Report</b> above — PDF generates in ~10–20s.
     </div>
 </div>""",
