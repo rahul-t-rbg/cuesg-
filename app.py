@@ -820,6 +820,7 @@ def ensure_state() -> None:
         "dossier_md": "",
         "dossier_pdf": b"",
         "cached_forecast_df": None,
+        "_trigger_pdf_build": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -901,11 +902,15 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
     raise ValueError(f"Unsupported dataset format: .{ext}")
 
 
+
 def activate_portfolio(raw_df: pd.DataFrame, source_name: str) -> None:
     calculated_df, detected_columns = math_engine.calculate(raw_df)
     ai_engine.train_models(calculated_df)
     package = ai_engine.process(calculated_df, detected_columns, source_name)
     st.session_state.active_package = package
+    st.session_state.dossier_pdf = b""
+    st.session_state.dossier_md = ""
+    st.session_state["_dossier_sig"] = ""
     st.session_state.messages = [{"role": "assistant", "content": f"[OMNI-SYSTEM] {source_name} loaded — {package.summary['assets']} assets, {package.summary['records']} records, {package.summary['total_carbon']:.1f} tCO₂e total carbon.", "actions": package.summary.get("outlier_actions", [])[:2]}]
     st.session_state.session_carbon_g += carbon_tracker.estimate_upload_footprint(package.summary["records"], len(package.df.columns), source_name)
 
@@ -1571,7 +1576,7 @@ def render_system_runtime_workspace(package) -> None:
     except ImportError:
         rl_status = "ReportLab ✗ (plain-text PDF)"
 
-    gemini_status = "✓ Active" if bool(os.getenv("GEMINI_API_KEY", "")) else "✗ Not set (regex OCR active)"
+    gemini_status = "✓ Gemini 1.5 Flash Active" if bool(os.getenv("GEMINI_API_KEY", "")) else "✗ Not set — add GEMINI_API_KEY to .env for AI OCR"
     openai_status = "✓ Active" if bool(os.getenv("OPENAI_API_KEY", "")) else "✗ Not set"
 
     runtime = pd.DataFrame([
@@ -1654,6 +1659,84 @@ def render_detailed_dossier_workspace(package, forecast_df: pd.DataFrame, figure
         render_report_status_workspace(package)
 
 
+
+# ── Gemini Vision OCR Helper ──────────────────────────────────────────────────
+def _parse_bill_gemini(file_bytes: bytes, mime_type: str, is_pdf: bool = False) -> dict:
+    """
+    Extract ESG metrics from any utility bill using Gemini Vision API.
+    Falls back gracefully to regex/pdfplumber if API key not set.
+    """
+    import base64, json as _json, re as _re
+
+    GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+
+    if GEMINI_KEY:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=GEMINI_KEY)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+
+            # Encode file
+            b64 = base64.b64encode(file_bytes).decode()
+
+            prompt = """You are an ESG data extraction engine. Extract the following fields from this utility bill image.
+Return ONLY a JSON object with these exact keys (use null if not found):
+{
+  "energy_kwh": <number or null>,
+  "diesel_litres": <number or null>,
+  "water_withdrawal_kl": <number or null>,
+  "solar_kwh": <number or null>,
+  "utility_cost_inr": <number or null>,
+  "bill_month": "<YYYY-MM or null>",
+  "vendor_name": "<string or null>",
+  "account_id": "<string or null>",
+  "asset_id": "<string or null>",
+  "meter_reading_start": <number or null>,
+  "meter_reading_end": <number or null>
+}
+Extract only from what is clearly visible. Do not guess. Return valid JSON only."""
+
+            response = model.generate_content([
+                prompt,
+                {"mime_type": mime_type if not is_pdf else "application/pdf", "data": b64}
+            ])
+
+            raw = response.text.strip()
+            # Strip markdown code fences if present
+            raw = _re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = _re.sub(r"\n?```$", "", raw)
+            extracted = _json.loads(raw)
+
+            # Score confidence based on how many key fields were found
+            key_fields = ["energy_kwh", "diesel_litres", "water_withdrawal_kl", "utility_cost_inr"]
+            found = sum(1 for k in key_fields if extracted.get(k) is not None)
+            confidence = 0.70 + (found / len(key_fields)) * 0.30
+
+            extracted["_confidence"] = round(confidence, 2)
+            extracted["_ocr_engine"] = "Gemini 1.5 Flash Vision"
+            extracted["_status"] = f"Gemini Vision extracted {found}/{len(key_fields)} key fields"
+            extracted["_flag_for_review"] = confidence < 0.90
+            extracted["_auto_ingest"] = confidence >= 0.75
+            return extracted
+
+        except Exception as _gem_e:
+            # Fall through to regex fallback
+            pass
+
+    # ── Fallback: use existing reg_engine parsers ──
+    if is_pdf:
+        result = reg_engine.parse_utility_bill_pdf(file_bytes)
+    else:
+        result = reg_engine.parse_utility_bill_image(file_bytes, mime_type)
+
+    # Ensure _auto_ingest is set based on confidence
+    conf = float(result.get("_confidence", 0.0))
+    result["_auto_ingest"] = conf >= 0.75
+    result["_flag_for_review"] = 0.75 <= conf < 0.90
+    if not GEMINI_KEY:
+        result["_status"] = (result.get("_status") or "") + " | Set GEMINI_API_KEY env var for AI-powered extraction"
+    return result
+
 # --- MAIN LAYOUT ---
 
 main_col = st.container()
@@ -1662,9 +1745,15 @@ with main_col:
     # Action bar: Generate Report | Analysis | Reset
     ab_left, ab_mid, ab_right = st.columns([3, 3, 1], gap="small")
     if ab_left.button("⬡ Generate Compliance Report", use_container_width=True):
-        queue_prompt("Export the official compliance dossier.")
+        _pkg_btn = st.session_state.active_package
+        if _pkg_btn is None:
+            st.warning("Load a dataset first.")
+        else:
+            st.session_state["_trigger_pdf_build"] = True
+            
     if ab_mid.button("◎ Run Anomaly + Forecast Analysis", use_container_width=True):
         queue_prompt("Run full anomaly detection and 12-month forecast. Summarise key findings.")
+        
     if ab_right.button("↺ Reset", use_container_width=True):
         for key in ["messages", "active_package", "pending_bill", "rolling_context",
                     "dossier_md", "dossier_pdf", "cached_forecast_df"]:
@@ -1672,10 +1761,9 @@ with main_col:
                 del st.session_state[key]
         st.rerun()
 
-
     if not st.session_state.control_room:
         st.markdown(
-"""<div class="hero-container">
+            """<div class="hero-container">
     <div class="hero-title">CUESG</div>
     <div class="hero-copy">Drop in a messy spreadsheet — or hit ⚡ Load Demo Data to start instantly. Tracks carbon across all three scopes, parses utility bills via OCR, flags anomalies before they become audit issues, and runs what-if scenarios against SEBI BRSR Principle 6. Built for Indian commercial portfolios.</div>
 </div>""",
@@ -1694,12 +1782,14 @@ with main_col:
                         st.session_state.active_signature = signature
                     except Exception as exc:
                         st.error(f"Could not load dataset: {exc}")
+                        
             demo_col, master_col = st.columns(2, gap="small")
             with demo_col:
                 if st.button("⚡ Load Demo Data", use_container_width=True, help="Generate synthetic 8-asset, 24-month Indian portfolio — no file needed"):
                     demo_df = generate_synthetic_demo_data()
                     activate_portfolio(demo_df, "CUESG-Demo-Portfolio (Synthetic)")
                     st.session_state.active_signature = "demo"
+                    
             with master_col:
                 if st.button("Load Master Dataset", use_container_width=True):
                     master = load_master_dataset()
@@ -1724,9 +1814,14 @@ with main_col:
                 )
                 if bill_image is not None:
                     if st.button("🔍 Parse Bill OCR", use_container_width=True, key="parse_img_btn"):
-                        with st.spinner("Running CUESG Omni-Parser…"):
-                            result = reg_engine.parse_utility_bill_image(bill_image.getvalue(), bill_image.type or "image/png")
-                            st.session_state.pending_bill = result
+                        with st.spinner("Running CUESG Omni-Parser (Gemini Vision + regex fallback)…"):
+                            try:
+                                result = _parse_bill_gemini(bill_image.getvalue(), bill_image.type or "image/png", is_pdf=False)
+                                st.session_state.pending_bill = result
+                            except Exception as _ocr_e:
+                                st.error(f"OCR error: {_ocr_e}")
+                                result = reg_engine.parse_utility_bill_image(bill_image.getvalue(), bill_image.type or "image/png")
+                                st.session_state.pending_bill = result
             else:
                 bill_pdf = st.file_uploader(
                     "Upload utility bill PDF (BESCOM, Tata Power, Water board…)",
@@ -1734,95 +1829,102 @@ with main_col:
                 )
                 if bill_pdf is not None:
                     if st.button("🔍 Parse PDF Bill", use_container_width=True, key="parse_pdf_btn"):
-                        with st.spinner("Running CUESG PDF Parser (pdfplumber → PyMuPDF → regex)…"):
-                            result = reg_engine.parse_utility_bill_pdf(bill_pdf.getvalue())
-                            st.session_state.pending_bill = result
+                        with st.spinner("Running CUESG PDF Parser (Gemini Vision + pdfplumber fallback)…"):
+                            try:
+                                result = _parse_bill_gemini(bill_pdf.getvalue(), "application/pdf", is_pdf=True)
+                                st.session_state.pending_bill = result
+                            except Exception as _pdf_e:
+                                st.error(f"PDF OCR error: {_pdf_e}")
+                                result = reg_engine.parse_utility_bill_pdf(bill_pdf.getvalue())
+                                st.session_state.pending_bill = result
 
-            # ── OCR Result Display ────────────────────────────────────────────
-            if st.session_state.pending_bill is not None:
-                bill = st.session_state.pending_bill
-                conf = float(bill.get("_confidence", 0.0))
-                status = str(bill.get("_status", ""))
-                engine = str(bill.get("_ocr_engine", "unknown"))
-                flag = bool(bill.get("_flag_for_review", False))
-                auto_ingest = bool(bill.get("_auto_ingest", False))
+        # ── OCR Result Display ────────────────────────────────────────────
+        if st.session_state.pending_bill is not None:
+            bill = st.session_state.pending_bill
+            conf = float(bill.get("_confidence", 0.0))
+            status = str(bill.get("_status", ""))
+            engine = str(bill.get("_ocr_engine", "unknown"))
+            flag = bool(bill.get("_flag_for_review", False))
+            auto_ingest = bool(bill.get("_auto_ingest", False))
 
-                # Confidence badge
-                if conf >= 0.90:
-                    badge_color, badge_label = "#00ff7f", "✓ AUTO-ACCEPT"
-                elif conf >= 0.75:
-                    badge_color, badge_label = "#d29922", "⚠ REVIEW FLAGGED"
-                else:
-                    badge_color, badge_label = "#f85149", "✗ MANUAL ENTRY"
+            # Confidence badge
+            if conf >= 0.90:
+                badge_color, badge_label = "#00ff7f", "✓ AUTO-ACCEPT"
+            elif conf >= 0.75:
+                badge_color, badge_label = "#d29922", "⚠ REVIEW FLAGGED"
+            else:
+                badge_color, badge_label = "#f85149", "✗ MANUAL ENTRY"
 
-                st.markdown(
-                    f"<div style='font-family:Manrope,sans-serif;font-size:0.68rem;"
-                    f"background:rgba(13,17,23,0.8);border:1px solid {badge_color}33;"
-                    f"border-left:3px solid {badge_color};padding:10px 14px;"
-                    f"border-radius:8px;margin:8px 0;'>"
-                    f"<span style='color:{badge_color};font-weight:700;'>{badge_label}</span>"
-                    f"<span style='color:#4d5a6a;margin-left:10px;'>Confidence: {conf:.2f} | Engine: {engine}</span>"
-                    f"<br/><span style='color:#8b949e;font-size:0.62rem;'>{status}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
+            st.markdown(
+                f"<div style='font-family:Manrope,sans-serif;font-size:0.68rem;"
+                f"background:rgba(13,17,23,0.8);border:1px solid {badge_color}33;"
+                f"border-left:3px solid {badge_color};padding:10px 14px;"
+                f"border-radius:8px;margin:8px 0;'>"
+                f"<span style='color:{badge_color};font-weight:700;'>{badge_label}</span>"
+                f"<span style='color:#4d5a6a;margin-left:10px;'>Confidence: {conf:.2f} | Engine: {engine}</span>"
+                f"<br/><span style='color:#8b949e;font-size:0.62rem;'>{status}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-                if auto_ingest:
-                    # Show clean extracted fields
-                    display_keys = ["energy_kwh", "diesel_litres", "water_withdrawal_kl", "utility_cost_inr", "solar_kwh", "bill_month", "vendor_name", "account_id"]
-                    clean_bill = {k: v for k, v in bill.items() if k in display_keys and v is not None}
-                    if clean_bill:
-                        st.json(clean_bill)
-                    if flag:
-                        st.warning("⚠ Yellow flag: confidence 0.75–0.89. This record will be marked for monthly audit review.")
-                    if st.button("✅ Append to Portfolio", use_container_width=True, key="append_ocr_btn") and st.session_state.active_package is not None:
-                        updated_df = reg_engine.append_utility_bill_to_df(st.session_state.active_package, bill)
-                        activate_portfolio(updated_df, f"{st.session_state.active_package.source_name} + OCR")
-                        st.session_state.pending_bill = None
-                        st.success("Bill appended and portfolio recalculated.")
-                    elif st.session_state.active_package is None:
-                        st.info("Load a portfolio dataset first, then append the bill.")
-                else:
-                    # HARD STOP — manual entry form
-                    st.error("🛑 HARD STOP: Confidence too low for auto-ingest. Please verify and enter values manually.")
-                    with st.form("manual_bill_entry"):
-                        st.markdown("**Manual Bill Entry** — fill in what you can read from the bill:")
-                        m_col1, m_col2 = st.columns(2)
-                        with m_col1:
-                            m_energy = st.number_input("Energy (kWh)", min_value=0.0, value=float(bill.get("energy_kwh") or 0.0), step=100.0)
-                            m_diesel = st.number_input("Diesel (Litres)", min_value=0.0, value=float(bill.get("diesel_litres") or 0.0), step=10.0)
-                            m_water  = st.number_input("Water (kL)", min_value=0.0, value=float(bill.get("water_withdrawal_kl") or 0.0), step=1.0)
-                        with m_col2:
-                            m_cost   = st.number_input("Utility Cost (INR)", min_value=0.0, value=float(bill.get("utility_cost_inr") or 0.0), step=1000.0)
-                            m_month  = st.text_input("Bill Month (YYYY-MM)", value=str(bill.get("bill_month") or ""))
-                            m_asset  = st.text_input("Asset ID", value=str(bill.get("asset_id") or ""))
-                        submitted = st.form_submit_button("✅ Confirm & Append to Portfolio")
-                        if submitted and st.session_state.active_package is not None:
-                            manual_bill = {
-                                "energy_kwh": m_energy if m_energy > 0 else None,
-                                "diesel_litres": m_diesel if m_diesel > 0 else None,
-                                "water_withdrawal_kl": m_water if m_water > 0 else None,
-                                "utility_cost_inr": m_cost if m_cost > 0 else None,
-                                "bill_month": m_month if m_month.strip() else None,
-                                "asset_id": m_asset.strip() if m_asset.strip() else None,
-                                "_confidence": 1.0,  # human-verified
-                                "_ocr_engine": "manual",
-                            }
-                            updated_df = reg_engine.append_utility_bill_to_df(st.session_state.active_package, manual_bill)
-                            activate_portfolio(updated_df, f"{st.session_state.active_package.source_name} + Manual-Bill")
-                            st.session_state.pending_bill = None
-                            st.success("Manual bill entry confirmed and appended.")
-                        elif submitted:
-                            st.info("Load a portfolio dataset first, then append the bill.")
-
-                if st.button("✕ Clear bill result", key="clear_bill_btn", use_container_width=False):
+            if auto_ingest:
+                # Show clean extracted fields
+                display_keys = ["energy_kwh", "diesel_litres", "water_withdrawal_kl", "utility_cost_inr", "solar_kwh", "bill_month", "vendor_name", "account_id"]
+                clean_bill = {k: v for k, v in bill.items() if k in display_keys and v is not None}
+                if clean_bill:
+                    st.json(clean_bill)
+                if flag:
+                    st.warning("⚠ Yellow flag: confidence 0.75–0.89. This record will be marked for monthly audit review.")
+                if st.button("✅ Append to Portfolio", use_container_width=True, key="append_ocr_btn") and st.session_state.active_package is not None:
+                    updated_df = reg_engine.append_utility_bill_to_df(st.session_state.active_package, bill)
+                    activate_portfolio(updated_df, f"{st.session_state.active_package.source_name} + OCR")
                     st.session_state.pending_bill = None
+                    st.success("Bill appended and portfolio recalculated.")
+                elif st.session_state.active_package is None:
+                    st.info("Load a portfolio dataset first, then append the bill.")
+            else:
+                # Low confidence — show what was extracted with manual override form
+                st.warning("⚠ Low confidence extraction. Review and correct fields below before appending.")
+                with st.form("manual_bill_entry"):
+                    st.markdown("**Manual Bill Entry** — fill in what you can read from the bill:")
+                    m_col1, m_col2 = st.columns(2)
+                    with m_col1:
+                        m_energy = st.number_input("Energy (kWh)", min_value=0.0, value=float(bill.get("energy_kwh") or 0.0), step=100.0)
+                        m_diesel = st.number_input("Diesel (Litres)", min_value=0.0, value=float(bill.get("diesel_litres") or 0.0), step=10.0)
+                        m_water  = st.number_input("Water (kL)", min_value=0.0, value=float(bill.get("water_withdrawal_kl") or 0.0), step=1.0)
+                    with m_col2:
+                        m_cost   = st.number_input("Utility Cost (INR)", min_value=0.0, value=float(bill.get("utility_cost_inr") or 0.0), step=1000.0)
+                        m_month  = st.text_input("Bill Month (YYYY-MM)", value=str(bill.get("bill_month") or ""))
+                        m_asset  = st.text_input("Asset ID", value=str(bill.get("asset_id") or ""))
+                    
+                    submitted = st.form_submit_button("✅ Confirm & Append to Portfolio")
+                    
+                    if submitted and st.session_state.active_package is not None:
+                        manual_bill = {
+                            "energy_kwh": m_energy if m_energy > 0 else None,
+                            "diesel_litres": m_diesel if m_diesel > 0 else None,
+                            "water_withdrawal_kl": m_water if m_water > 0 else None,
+                            "utility_cost_inr": m_cost if m_cost > 0 else None,
+                            "bill_month": m_month if m_month.strip() else None,
+                            "asset_id": m_asset.strip() if m_asset.strip() else None,
+                            "_confidence": 1.0,  # human-verified
+                            "_ocr_engine": "manual",
+                        }
+                        updated_df = reg_engine.append_utility_bill_to_df(st.session_state.active_package, manual_bill)
+                        activate_portfolio(updated_df, f"{st.session_state.active_package.source_name} + Manual-Bill")
+                        st.session_state.pending_bill = None
+                        st.success("Manual bill entry confirmed and appended.")
+                    elif submitted:
+                        st.info("Load a portfolio dataset first, then append the bill.")
+
+            if st.button("✕ Clear bill result", key="clear_bill_btn", use_container_width=False):
+                st.session_state.pending_bill = None
 
         st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
 
         # 4 hint cards across one row
         st.markdown(
-"""<div class="hint-grid">
+            """<div class="hint-grid">
     <div class="hint-card">
         <div class="hint-title">✦ Rankings</div>
         <div class="hint-copy">"List the 5 most sustainable buildings and explain why."</div>
@@ -1861,8 +1963,10 @@ if not st.session_state.control_room:
         with wif_left:
             solar_kw = st.slider("Solar PV Addition (kW)", 0, 500, 50, 10, key="wif_solar")
         with wif_right:
-            setpoint_delta = st.slider("HVAC Setpoint Reduction (\u00b0C)", 0.0, 4.0, 1.0, 0.5, key="wif_hvac")
-        st.caption(f"Simulate: +{solar_kw} kW solar  |  HVAC setpoint -{setpoint_delta}\u00b0C  |  Est. annual Scope 2 reduction: ~{solar_kw * 0.727 * 2400 / 1000:.1f} tCO\u2082")
+            setpoint_delta = st.slider("HVAC Setpoint Reduction (°C)", 0.0, 4.0, 1.0, 0.5, key="wif_hvac")
+            
+        st.caption(f"Simulate: +{solar_kw} kW solar  |  HVAC setpoint -{setpoint_delta}°C  |  Est. annual Scope 2 reduction: ~{solar_kw * 0.727 * 2400 / 1000:.1f} tCO₂")
+        
         if st.button("Run What-If Simulation", use_container_width=True, key="wif_run"):
             queue_prompt(
                 f"Run a what-if scenario: we install {solar_kw}kW of solar PV "
@@ -1877,47 +1981,21 @@ prompt = st.session_state.queued_prompt or st.chat_input("Issue a data query, mu
 if prompt:
     st.session_state.queued_prompt = ""
     st.session_state.messages.append({"role": "user", "content": prompt})
+    
     if st.session_state.active_package is None:
         st.session_state.messages.append({"role": "assistant", "content": "[OMNI-SYSTEM] Load a dataset first."})
     else:
         if "export" in prompt.lower() and "dossier" in prompt.lower():
             _pkg = st.session_state.active_package
-            with st.status("Building compliance dossier...", expanded=True) as _status:
-                st.write("Step 1/5 — Loading forecast data...")
-                # Reuse cached forecast if available, otherwise compute
-                if st.session_state.cached_forecast_df is not None and st.session_state.get("_forecast_sig") == _pkg.source_name:
-                    _forecast_df = st.session_state.cached_forecast_df
-                else:
-                    _forecast_df = ai_engine.forecast_portfolio(_pkg.df, months=12)
-                    st.session_state.cached_forecast_df = _forecast_df
-                    st.session_state["_forecast_sig"] = _pkg.source_name
-
-                st.write("Step 2/5 — Generating charts...")
-                _scope_df = pd.DataFrame({
-                    "Scope": ["Scope 1", "Scope 2", "Scope 3"],
-                    "tCO2e": [_pkg.summary["scope1_total"], _pkg.summary["scope2_total"], _pkg.summary["scope3_total"]],
-                })
-                _shap_fig = ai_engine.build_shap_figure(_pkg)
-                _export_figures = {
-                    "Emissions Breakdown": px.pie(_scope_df, names="Scope", values="tCO2e", hole=0.6,
-                        color_discrete_map={"Scope 1": "#f85149", "Scope 2": "#58a6ff", "Scope 3": "#00ff7f"}),
-                    "12-Month Forecast": ai_engine.build_forecast_figure(_forecast_df),
-                    "SHAP Root-Cause Analysis": _shap_fig if _shap_fig is not None else ai_engine.build_energy_figure(_pkg),
-                    "Monthly Energy": ai_engine.build_energy_figure(_pkg),
-                }
-
-                st.write("Step 3/5 — Compiling markdown report...")
-                dossier_md = reg_engine.build_markdown_report(_pkg, _forecast_df, st.session_state.messages, st.session_state.rolling_context)
-
-                st.write("Step 4/5 — Rendering PDF (this is the slow step)...")
-                dossier_pdf = reg_engine.build_pdf_report(dossier_md, _export_figures, st.session_state.messages, st.session_state.rolling_context, _pkg, forecast_df=_forecast_df)
-
-                st.write("Step 5/5 — Saving to session...")
-                st.session_state.dossier_md = dossier_md
-                st.session_state.dossier_pdf = dossier_pdf
-                _status.update(label="Dossier ready — scroll down to download.", state="complete", expanded=False)
-
-            st.session_state.messages.append({"role": "assistant", "content": f"[OMNI-SYSTEM] Dossier complete. PDF is {len(dossier_pdf):,} bytes. Scroll down to the download bar or use the buttons in the Control Room tab."})
+            with st.spinner("Building compliance dossier…"):
+                try:
+                    _chat_pdf, _chat_md = _build_pdf_now(_pkg)
+                    st.session_state.dossier_pdf = _chat_pdf
+                    st.session_state.dossier_md = _chat_md
+                    _sz = f"{len(_chat_pdf):,} bytes" if _chat_pdf else "generation failed"
+                    st.session_state.messages.append({"role": "assistant", "content": f"[OMNI-SYSTEM] Dossier complete — {_sz}. Scroll down to the Download section."})
+                except Exception as _chat_e:
+                    st.session_state.messages.append({"role": "assistant", "content": f"[OMNI-SYSTEM] PDF build error: {_chat_e}"})
         else:
             assistant_message, updated_package, rolling = reg_engine.chat_agent(st.session_state.messages, st.session_state.active_package, st.session_state.rolling_context)
             st.session_state.active_package = updated_package
@@ -1928,6 +2006,9 @@ if prompt:
 
 package = st.session_state.active_package
 
+# NOTE: It's generally best practice in Python to define functions at the module level.
+# `_build_pdf_now` is defined inside this `if` block, which means if `package is None`, 
+# the download buttons at the bottom will fail if they try to access it.
 if package is not None:
     render_command_snapshot(package)
     render_control_header(package)
@@ -1948,12 +2029,14 @@ if package is not None:
 
     figures: dict[str, go.Figure] = {}
     donut_col, energy_col = st.columns(2, gap="large")
+    
     with donut_col:
         scope_df = pd.DataFrame({"Scope": ["Scope 1 (CEA/IPCC)", "Scope 2 (CEA v20)", "Scope 3 (SEBI BRSR)"], "tCO2e": [package.summary["scope1_total"], package.summary["scope2_total"], package.summary["scope3_total"]]})
         donut = px.pie(scope_df, names="Scope", values="tCO2e", hole=0.62, color="Scope", color_discrete_map={"Scope 1 (CEA/IPCC)": "#f85149", "Scope 2 (CEA v20)": "#58a6ff", "Scope 3 (SEBI BRSR)": "#00ff7f"})
         donut.update_layout(**fig_layout("GHG Scope Breakdown  ·  CEA v20 + IPCC AR4 + SEBI BRSR"))
         figures["Emissions Breakdown"] = donut
         render_plot(donut, key="emissions_breakdown_main")
+        
     with energy_col:
         energy_fig = ai_engine.build_energy_figure(package)
         energy_fig.update_layout(**fig_layout("Monthly Energy Consumption  ·  Grid vs Solar  (CEA v20: 0.727 kg CO₂/kWh)"))
@@ -1978,6 +2061,7 @@ if package is not None:
             forecast_fig = ai_engine.build_forecast_figure(forecast_df)
             figures["12-Month Forecast"] = forecast_fig
             render_plot(forecast_fig, key="twelve_month_forecast_main")
+            
         with right:
             _recs = package.summary['records']
             _assets = package.summary['assets']
@@ -1986,7 +2070,7 @@ if package is not None:
                 f"**System State**\n\n"
                 f"- Records: `{_recs}` | Assets: `{_assets}`\n"
                 f"- Framework: `SEBI BRSR Principle {_brsr}`\n"
-                f"- Grid: `{DeterministicMath.CEA_FACTOR:.3f} kg CO\u2082/kWh  (CEA v20)`\n"
+                f"- Grid: `{DeterministicMath.CEA_FACTOR:.3f} kg CO₂/kWh  (CEA v20)`\n"
                 f"- Anomaly: `Isolation Forest  contamination=4%  (SRD v3.0)`\n"
                 f"- AI: `Precision >0.85  Recall >0.80  MAPE <15%`"
             )
@@ -2058,6 +2142,7 @@ if package is not None:
         benchmark_fig.update_layout(**fig_layout("Energy Intensity vs BEE Baseline  ·  Source: BEE Star Rating (140–180 kWh/m²/yr)"), yaxis=dict(title="Energy Intensity (kWh/m²)"))
         figures["Climate Benchmark Monitor"] = benchmark_fig
         render_plot(benchmark_fig, key="climate_benchmark_monitor_main")
+        
     with benchmark_shell_right:
         bee_fig = px.bar(
             package.asset_rankings.head(20).reset_index(drop=True),
@@ -2072,39 +2157,112 @@ if package is not None:
         with st.spinner("Computing 12-month forecast..."):
             st.session_state.cached_forecast_df = ai_engine.forecast_portfolio(package.df, months=12)
             st.session_state["_forecast_sig"] = package.source_name
+            
     forecast_df = st.session_state.cached_forecast_df
     st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
     render_detailed_dossier_workspace(package, forecast_df, figures)
 
-    # Only auto-build the dossier when source changes or it doesn't exist yet.
-    # The "Generate Compliance Report" button above triggers the richer, chart-embedded build.
-    _dossier_sig = f"auto:{package.source_name}"
-    if not st.session_state.dossier_md or st.session_state.get("_dossier_sig") != _dossier_sig:
-        dossier_md = reg_engine.build_markdown_report(package, forecast_df, st.session_state.messages, st.session_state.rolling_context)
-        st.session_state.dossier_md = dossier_md
-        st.session_state["_dossier_sig"] = _dossier_sig
-        if not st.session_state.dossier_pdf:
-            dossier_pdf = reg_engine.build_pdf_report(dossier_md, figures, st.session_state.messages, st.session_state.rolling_context, package, forecast_df=st.session_state.cached_forecast_df)
-            st.session_state.dossier_pdf = dossier_pdf
-
     st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
-    st.markdown(
-"""<div style="background:rgba(0,255,127,0.04);border:1px solid rgba(0,255,127,0.15);border-radius:12px;padding:16px 20px;margin-bottom:12px;">
-    <div style="font-family:'Plus Jakarta Sans',sans-serif;font-size:0.6rem;color:#00ff7f;letter-spacing:0.18em;text-transform:uppercase;font-weight:700;margin-bottom:6px;">✦ Final Report Downloads</div>
-    <div style="font-family:'Manrope',sans-serif;font-size:0.75rem;color:#4d5a6a;">
-        Use <b style="color:#c9d1d9;">⬡ Generate Compliance Report</b> above — PDF generates in ~10–20s.
+
+    # ── DOWNLOAD SECTION ──────────────────────────────────────────────────────
+    def _build_pdf_now(pkg) -> tuple[bytes, str]:
+        """Build and return (pdf_bytes, md_str) synchronously."""
+        if st.session_state.cached_forecast_df is not None and st.session_state.get("_forecast_sig") == pkg.source_name:
+            _fc = st.session_state.cached_forecast_df
+        else:
+            _fc = ai_engine.forecast_portfolio(pkg.df, months=12)
+            st.session_state.cached_forecast_df = _fc
+            st.session_state["_forecast_sig"] = pkg.source_name
+            
+        _s = pkg.summary
+        _sd = pd.DataFrame({"Scope": ["Scope 1", "Scope 2", "Scope 3"],
+                             "tCO2e": [_s["scope1_total"], _s["scope2_total"], _s["scope3_total"]]})
+        _sf = ai_engine.build_shap_figure(pkg)
+        _figs = {
+            "Emissions Breakdown": px.pie(_sd, names="Scope", values="tCO2e", hole=0.6,
+                color_discrete_map={"Scope 1": "#f85149", "Scope 2": "#58a6ff", "Scope 3": "#00ff7f"}),
+            "12-Month Forecast": ai_engine.build_forecast_figure(_fc),
+            "SHAP Root-Cause Analysis": _sf if _sf is not None else ai_engine.build_energy_figure(pkg),
+            "Monthly Energy": ai_engine.build_energy_figure(pkg),
+        }
+        _md = reg_engine.build_markdown_report(pkg, _fc, st.session_state.messages, st.session_state.rolling_context)
+        _pdf = reg_engine.build_pdf_report(_md, _figs, st.session_state.messages, st.session_state.rolling_context, pkg, forecast_df=_fc)
+        return (_pdf if isinstance(_pdf, bytes) and len(_pdf) > 200 else b""), _md
+
+    if st.session_state.get("_trigger_pdf_build") and st.session_state.active_package is not None:
+        with st.spinner("Building compliance dossier…"):
+            try:
+                _ab_pdf, _ab_md = _build_pdf_now(st.session_state.active_package)
+                st.session_state.dossier_pdf = _ab_pdf
+                st.session_state.dossier_md = _ab_md
+                st.session_state["_trigger_pdf_build"] = False
+                if _ab_pdf:
+                    st.success(f"✅ Dossier ready — {len(_ab_pdf):,} bytes. Download below.")
+                else:
+                    st.error("PDF build returned empty. Try again or check greenlens_pdf_engine.py.")
+            except Exception as _e:
+                st.error(f"PDF build failed: {_e}")
+                st.session_state["_trigger_pdf_build"] = False
+
+st.markdown(
+    """<div style="background:rgba(0,255,127,0.04);border:1px solid rgba(0,255,127,0.15);border-radius:12px;padding:16px 20px;margin-bottom:12px;">
+    <div style="font-family:'Plus Jakarta Sans',sans-serif;font-size:0.65rem;color:#00ff7f;letter-spacing:0.18em;text-transform:uppercase;font-weight:700;margin-bottom:6px;">
+        ✦ Download Report
+    </div>
+    <div style="font-family:'Manrope',sans-serif;font-size:0.8rem;color:#4d5a6a;">
+        Generate and instantly download your full report in one click.
     </div>
 </div>""",
-        unsafe_allow_html=True,
-    )
-    if st.session_state.dossier_pdf or st.session_state.dossier_md:
-        dl_left, dl_mid, dl_right = st.columns(3, gap="large")
-        with dl_left:
-            if st.session_state.dossier_pdf:
-                st.download_button("⬇ Download PDF", st.session_state.dossier_pdf, "cuesg_report.pdf", "application/pdf", use_container_width=True, key="footer_download_pdf")
-        with dl_mid:
-            if st.session_state.dossier_md:
-                st.download_button("⬇ Download Markdown", st.session_state.dossier_md, "cuesg_report.md", "text/markdown", use_container_width=True, key="footer_download_md")
-        with dl_right:
-            if st.session_state.dossier_md:
-                st.download_button("⬇ Download Text Log", st.session_state.dossier_md, "cuesg_report.txt", "text/plain", use_container_width=True, key="footer_download_txt")
+    unsafe_allow_html=True,
+)
+
+dl_left, dl_mid, dl_right = st.columns(3, gap="large")
+
+# ---------------- PDF DOWNLOAD ---------------- #
+with dl_left:
+    _pkg_dl = st.session_state.get("active_package", None)
+
+    if _pkg_dl is not None:
+        try:
+            # Generate instantly (no rerun, no state dependency)
+            pdf_bytes, md_text = _build_pdf_now(_pkg_dl)
+
+            if pdf_bytes and len(pdf_bytes) > 200:
+                st.download_button(
+                    label=f"⬇ Download PDF ({len(pdf_bytes)//1024} KB)",
+                    data=pdf_bytes,
+                    file_name="report.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            else:
+                st.warning("PDF generation failed.")
+
+            # Store optional (for reuse)
+            st.session_state.dossier_md = md_text or ""
+
+        except Exception as e:
+            st.error(f"PDF error: {e}")
+
+    else:
+        st.info("Load a dataset first to enable download.")
+
+with dl_mid:
+    if st.session_state.get("dossier_md"):
+        st.download_button(
+            "⬇ Download Markdown",
+            st.session_state.dossier_md,
+            "report.md",
+            "text/markdown",
+            use_container_width=True,
+        )
+
+with dl_right:
+    if st.session_state.get("dossier_md"):
+        st.download_button(
+            "⬇ Download Text",
+            st.session_state.dossier_md,
+            "report.txt",
+            "text/plain",
+            use_container_width=True,
+        )
